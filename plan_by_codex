@@ -1,0 +1,167 @@
+# StructX Build Plan (plan_by_codex)
+
+## 1. Product Goal
+Build StructX as a graph-powered code intelligence system that:
+- Parses TypeScript code into a function-level graph.
+- Enriches each function with semantic metadata using LLM analysis.
+- Answers developer questions using graph retrieval instead of full-repo prompting.
+- Benchmarks quality, cost, and latency against a traditional full-context agent.
+
+## 2. V1 Scope
+In scope:
+- TypeScript repositories only.
+- Function-level extraction (signature, location, calls, callers, imports).
+- Semantic fields: `purpose`, `behavior`, `side_effects`, `domain`, `complexity`.
+- Incremental re-analysis for changed functions.
+- Query-time retrieval for direct lookup, relationship lookup, semantic search, domain search, and impact analysis.
+- Benchmark framework with fixed test questions and metric capture.
+
+Out of scope (for now):
+- Multi-language parsing.
+- IDE plugin UI.
+- Automated code edits.
+
+## 3. Technical Architecture
+Core components:
+- `ingest` service: scans files, extracts AST/function graph, updates DB.
+- `semantic` worker: batches functions, calls LLM, validates JSON, stores enrichment.
+- `query` engine: converts developer questions to retrieval strategy and builds compact context.
+- `benchmark` runner: compares baseline agent vs StructX agent and records metrics.
+- `storage` layer: SQLite (with FTS) for graph + semantic data + run history.
+
+Recommended stack:
+- Runtime: Node.js + TypeScript.
+- Parsing: `ts-morph` (or TypeScript compiler API directly).
+- DB: SQLite + FTS5.
+- CLI: `commander` or `yargs`.
+- LLM adapter: provider-agnostic interface with Anthropic implementation first.
+
+## 4. Data Model Plan
+Create migrations for:
+- `files(id, path, hash, updated_at)`
+- `functions(id, file_id, name, signature, start_line, end_line, code_hash, exported, async, semantic_analyzed_at, purpose, behavior_summary, side_effects_json, domain, complexity)`
+- `relationships(id, caller_function_id, callee_function_id, relation_type)` (`calls`, `imports`)
+- `analysis_queue(id, function_id, priority, reason, status, created_at, processed_at)`
+- `semantic_cache(id, function_id, prompt_hash, model, input_tokens, output_tokens, cost_usd, response_json, created_at)`
+- `qa_runs(id, mode, question, input_tokens, output_tokens, total_tokens, cost_usd, response_time_ms, files_accessed, functions_retrieved, graph_query_time_ms, answer_text, created_at)`
+
+Indexes:
+- `functions(name)`, `functions(domain)`, `functions(file_id)`
+- `relationships(callee_function_id)`, `relationships(caller_function_id)`
+- FTS index on `purpose` + `behavior_summary`
+
+## 5. Delivery Phases
+
+### Phase 0: Setup and Scaffolding (2-3 days)
+Tasks:
+- Initialize project structure (`src/ingest`, `src/semantic`, `src/query`, `src/benchmark`, `src/db`).
+- Add configuration system (`repo_path`, model, batching size, thresholds).
+- Add DB migration runner and base schema.
+- Add structured logging and error handling conventions.
+
+Exit criteria:
+- `structx init` creates DB and config.
+- `structx doctor` validates environment and API keys.
+
+### Phase 1: Static Code Graph Extraction (5-7 days)
+Tasks:
+- Parse all `.ts/.tsx` files.
+- Extract functions with metadata (name, signature, location, body hash).
+- Extract call relationships and import references.
+- Persist files/functions/relationships.
+- Add coverage report: parsed files, extracted functions, unresolved calls.
+
+Exit criteria:
+- `structx ingest` runs end-to-end on a sample TS repo.
+- Graph data queryable for "calls" and "called by".
+
+### Phase 2: Semantic Enrichment Pipeline (5-7 days)
+Tasks:
+- Implement function batching (5-10 functions/request).
+- Build strict prompt + JSON schema validation.
+- Add retry and fallback for malformed model output.
+- Sanitize and store semantic fields.
+- Track token usage and per-batch cost.
+- Add pre-run cost estimate and confirmation flow.
+
+Exit criteria:
+- `structx analyze` enriches queued functions reliably.
+- JSON validation pass rate >= 99% after retries.
+
+### Phase 3: Incremental Re-Analysis (3-4 days)
+Tasks:
+- Detect changed files with hashes.
+- Recompute function diff signals (signature changed, body changed ratio > threshold `0.3`, dependencies changed).
+- Enqueue only impacted functions with reason tags.
+- Add priority processing for exported/public functions.
+
+Exit criteria:
+- Re-running ingest on small diff only re-analyzes impacted functions.
+- Queue metrics are visible (`pending`, `processing`, `failed`, `done`).
+
+### Phase 4: Query-Time Retrieval Engine (5-7 days)
+Tasks:
+- Implement question classifier for retrieval modes (direct function lookup, caller/callee relationship query, semantic keyword search, domain filter, impact analysis via transitive callers).
+- Assemble compact context payload (1k-3k tokens target).
+- Add final answer generation using same model used by baseline.
+
+Exit criteria:
+- `structx ask "What does login do?"` returns accurate graph-grounded answer.
+- Context payload size remains within target for common queries.
+
+### Phase 5: Benchmark Framework (4-5 days)
+Tasks:
+- Implement baseline runner (full-context or heuristic large-context loading).
+- Implement StructX runner (graph retrieval).
+- Run fixed evaluation question set from idea.
+- Capture tokens, cost, latency, retrieval stats.
+- Export markdown and CSV comparison tables.
+
+Exit criteria:
+- `structx benchmark run` produces reproducible report.
+- Report includes side-by-side metrics for each question.
+
+### Phase 6: Hardening and Release Candidate (3-5 days)
+Tasks:
+- Add integration tests for ingest, analyze, ask, benchmark.
+- Add regression tests for parser and JSON parsing failures.
+- Add performance tests for medium repo scale.
+- Write operator docs and troubleshooting guide.
+- Freeze CLI and schema for v1 release.
+
+Exit criteria:
+- Stable RC tag with docs and passing test suite.
+
+## 6. Success Metrics
+Core targets:
+- Function extraction coverage >= 95% on TS repos.
+- Semantic JSON parse success >= 99% (with retries).
+- StructX token usage reduction >= 60% vs baseline on benchmark set.
+- StructX API cost reduction >= 50% vs baseline.
+- StructX median latency <= baseline median latency.
+- Answer quality: no significant degradation in manual review rubric.
+
+## 7. Risks and Mitigations
+Risk: AST extraction misses dynamic patterns.
+Mitigation: mark unresolved edges explicitly; include confidence flags.
+
+Risk: Model returns invalid JSON.
+Mitigation: schema validation + auto-retry with repair prompt.
+
+Risk: Poor semantic labeling consistency.
+Mitigation: fixed taxonomy for `domain` and `complexity`, plus normalization rules.
+
+Risk: Baseline comparison unfairness.
+Mitigation: use same answer model, same questions, same temperature, log exact prompts.
+
+## 8. First Execution Checklist
+1. Create TypeScript project scaffold and migration system.
+2. Implement DB schema above.
+3. Build `ingest` for functions + call graph.
+4. Add `analysis_queue` population logic.
+5. Add semantic prompt template and JSON validator.
+6. Implement `analyze` worker with batching and cost tracking.
+7. Implement `ask` command with direct + relationship queries first.
+8. Add benchmark runner and report generator.
+9. Validate on a real TS repo and tune thresholds.
+10. Document commands and expected outputs.

@@ -1,0 +1,39 @@
+{
+  "name": "structx",
+  "version": "2.2.1",
+  "main": "dist/cli.js",
+  "bin": {
+    "structx": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.js",
+    "dev": "tsx src/cli.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "code-intelligence",
+    "typescript",
+    "ast",
+    "llm"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "Graph-powered code intelligence CLI for TypeScript",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.74.0",
+    "better-sqlite3": "^12.6.2",
+    "commander": "^14.0.3",
+    "dotenv": "^17.2.4",
+    "ts-morph": "^27.0.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.2.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
