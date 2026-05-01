@@ -1,9 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { ProviderName } from './providers/factory';
 
 export interface StructXConfig {
   repoPath: string;
   anthropicApiKey: string;
+  geminiApiKey: string;
+  openrouterApiKey: string;
+  provider: ProviderName | null;
   analysisModel: string;
   classifierModel: string;
   answerModel: string;
@@ -12,7 +16,7 @@ export interface StructXConfig {
   structxDir: string;
 }
 
-const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'structxDir'> = {
+const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'geminiApiKey' | 'openrouterApiKey' | 'provider' | 'structxDir'> = {
   analysisModel: 'claude-haiku-4-5-20251001',
   classifierModel: 'claude-haiku-4-5-20251001',
   answerModel: 'claude-sonnet-4-5-20250929',
@@ -38,11 +42,16 @@ export function loadConfig(structxDir: string): StructXConfig {
 
   const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
   const apiKey = raw.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '';
+  const geminiApiKey = raw.geminiApiKey || process.env.GEMINI_API_KEY || '';
+  const openrouterApiKey = raw.openrouterApiKey || process.env.OPENROUTER_API_KEY || '';
 
   return {
     ...DEFAULT_CONFIG,
     ...raw,
     anthropicApiKey: apiKey,
+    geminiApiKey,
+    openrouterApiKey,
+    provider: raw.provider || null,
     structxDir,
   };
 }
@@ -54,10 +63,16 @@ export function saveConfig(structxDir: string, config: Partial<StructXConfig>): 
     fs.mkdirSync(structxDir, { recursive: true });
   }
 
-  // Don't persist the API key to disk if it came from env
+  // Don't persist API keys to disk if they came from env
   const toSave = { ...config };
   if (process.env.ANTHROPIC_API_KEY && toSave.anthropicApiKey === process.env.ANTHROPIC_API_KEY) {
     delete toSave.anthropicApiKey;
+  }
+  if (process.env.GEMINI_API_KEY && toSave.geminiApiKey === process.env.GEMINI_API_KEY) {
+    delete toSave.geminiApiKey;
+  }
+  if (process.env.OPENROUTER_API_KEY && toSave.openrouterApiKey === process.env.OPENROUTER_API_KEY) {
+    delete toSave.openrouterApiKey;
   }
   delete toSave.structxDir;
 

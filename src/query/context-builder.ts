@@ -1,6 +1,8 @@
 import type { RetrievedContext, RetrievedFunction, RetrievedType, RetrievedRoute, RetrievedFile, RetrievedConstant } from './retriever';
 import { estimateTokens } from '../utils/tokens';
 
+const DEFAULT_CONTEXT_TOKEN_BUDGET = 3000;
+
 export function buildContext(retrieved: RetrievedContext, question: string): string {
   const totalEntities = retrieved.functions.length + retrieved.types.length +
     retrieved.routes.length + retrieved.files.length + retrieved.constants.length;
@@ -59,10 +61,27 @@ export function buildContext(retrieved: RetrievedContext, question: string): str
       if (retrieved.functions.length > 0) sections.push(formatSemanticContext(retrieved.functions));
   }
 
-  const context = sections.join('\n\n');
+  let context = sections.join('\n\n');
+  context = fitContextToBudget(context, DEFAULT_CONTEXT_TOKEN_BUDGET);
   const tokens = estimateTokens(context);
 
   return `[Context retrieved via ${retrieved.strategy} strategy | ${totalEntities} entities | ~${tokens} tokens]\n\n${context}`;
+}
+
+export function fitContextToBudget(context: string, maxTokens: number): string {
+  if (estimateTokens(context) <= maxTokens) return context;
+
+  let compacted = context
+    .replace(/\n\s+Handler body: .*(?=\n|$)/g, '')
+    .replace(/\n\s+Definition:\n[\s\S]*?(?=\n\n\d+\.|\n\n[A-Z][A-Za-z]+:|$)/g, '');
+
+  if (estimateTokens(compacted) <= maxTokens) {
+    return `${compacted}\n\n[Context truncated to fit ~${maxTokens} tokens; large handler bodies and type definitions were omitted.]`;
+  }
+
+  const budgetChars = Math.max(500, maxTokens * 4);
+  compacted = compacted.slice(0, budgetChars).replace(/\n[^\n]*$/, '');
+  return `${compacted}\n\n[Context truncated to fit ~${maxTokens} tokens.]`;
 }
 
 function formatDirectContext(fn: RetrievedFunction): string {

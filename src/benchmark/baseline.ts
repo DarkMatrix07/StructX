@@ -1,6 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { LLMProvider } from '../providers/interface';
 import { scanDirectory } from '../ingest/scanner';
 import { estimateCost } from '../utils/tokens';
 
@@ -17,10 +17,8 @@ export async function runBaseline(
   question: string,
   repoPath: string,
   model: string,
-  apiKey: string
+  provider: LLMProvider
 ): Promise<BaselineResult> {
-  const client = new Anthropic({ apiKey });
-
   // Read all TypeScript files
   const files = scanDirectory(repoPath);
   let codeContext = '';
@@ -41,27 +39,19 @@ Question: ${question}`;
 
   const startTime = Date.now();
 
-  const response = await client.messages.create({
+  const response = await provider.chat({
     model,
-    max_tokens: 1024,
+    maxTokens: 1024,
     messages: [{ role: 'user', content: prompt }],
   });
 
   const responseTimeMs = Date.now() - startTime;
 
-  const answer = response.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as any).text)
-    .join('');
-
-  const inputTokens = response.usage?.input_tokens ?? 0;
-  const outputTokens = response.usage?.output_tokens ?? 0;
-
   return {
-    answer,
-    inputTokens,
-    outputTokens,
-    cost: estimateCost(model, inputTokens, outputTokens),
+    answer: response.text,
+    inputTokens: response.inputTokens,
+    outputTokens: response.outputTokens,
+    cost: estimateCost(model, response.inputTokens, response.outputTokens),
     responseTimeMs,
     filesAccessed,
   };

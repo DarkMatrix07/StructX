@@ -9,6 +9,7 @@ import {
   getConstantsByFileId, getFileOverview,
   searchFiles, getFileSummary, getFileByPath,
 } from '../db/queries';
+import { formatLocation, normalizeRepoPath } from '../utils/paths';
 
 export interface RetrievedContext {
   functions: RetrievedFunction[];
@@ -236,11 +237,12 @@ export function typeQuery(db: Database.Database, typeName: string): RetrievedCon
 
 export function fileQuery(db: Database.Database, filePath?: string | null): RetrievedContext {
   if (filePath) {
+    const normalizedFilePath = normalizeRepoPath(filePath);
     // Try exact match first, then partial
-    let fileRow = getFileByPath(db, filePath);
+    let fileRow = getFileByPath(db, normalizedFilePath);
     if (!fileRow) {
       const allFiles = getAllFiles(db);
-      fileRow = allFiles.find(f => f.path.includes(filePath)) || undefined;
+      fileRow = allFiles.find(f => normalizeRepoPath(f.path).includes(normalizedFilePath)) || undefined;
     }
     if (!fileRow) {
       return emptyContext('file');
@@ -329,7 +331,7 @@ export function patternQuery(db: Database.Database, keywords: string[]): Retriev
 
 function enrichFunction(db: Database.Database, fn: FunctionRow): RetrievedFunction {
   const file = db.prepare('SELECT path FROM files WHERE id = ?').get(fn.file_id) as any;
-  const location = file ? `${file.path}:${fn.start_line}` : `unknown:${fn.start_line}`;
+  const location = file ? formatLocation(file.path, fn.start_line) : `unknown:${fn.start_line}`;
 
   const callees = getCallees(db, fn.id);
   const callers = getCallers(db, fn.id);
@@ -369,7 +371,7 @@ function enrichFunction(db: Database.Database, fn: FunctionRow): RetrievedFuncti
 
 function enrichType(db: Database.Database, t: TypeRow): RetrievedType {
   const file = db.prepare('SELECT path FROM files WHERE id = ?').get(t.file_id) as any;
-  const location = file ? `${file.path}:${t.start_line}` : `unknown:${t.start_line}`;
+  const location = file ? formatLocation(file.path, t.start_line) : `unknown:${t.start_line}`;
   return {
     name: t.name,
     kind: t.kind,
@@ -382,7 +384,7 @@ function enrichType(db: Database.Database, t: TypeRow): RetrievedType {
 
 function enrichRoute(db: Database.Database, r: RouteRow): RetrievedRoute {
   const file = db.prepare('SELECT path FROM files WHERE id = ?').get(r.file_id) as any;
-  const location = file ? `${file.path}:${r.start_line}` : `unknown:${r.start_line}`;
+  const location = file ? formatLocation(file.path, r.start_line) : `unknown:${r.start_line}`;
   let middleware: string[] = [];
   try {
     if (r.middleware) middleware = JSON.parse(r.middleware);
@@ -400,7 +402,7 @@ function enrichRoute(db: Database.Database, r: RouteRow): RetrievedRoute {
 
 function enrichConstant(db: Database.Database, c: ConstantRow): RetrievedConstant {
   const file = db.prepare('SELECT path FROM files WHERE id = ?').get(c.file_id) as any;
-  const location = file ? `${file.path}:${c.start_line}` : `unknown:${c.start_line}`;
+  const location = file ? formatLocation(file.path, c.start_line) : `unknown:${c.start_line}`;
   return {
     name: c.name,
     location,
@@ -416,7 +418,7 @@ function enrichFileSummary(filePath: string, s: FileSummaryRow): RetrievedFile {
     if (s.exports_json) exports = JSON.parse(s.exports_json);
   } catch {}
   return {
-    path: filePath,
+    path: normalizeRepoPath(filePath),
     importCount: s.import_count,
     exportCount: s.export_count,
     functionCount: s.function_count,

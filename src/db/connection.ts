@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import * as path from 'path';
 import * as fs from 'fs';
+import { normalizeRepoPath } from '../utils/paths';
 
 const SCHEMA_PATH = path.join(__dirname, 'schema.sql');
 
@@ -12,6 +13,7 @@ export function openDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  normalizeExistingFilePaths(db);
   return db;
 }
 
@@ -79,4 +81,42 @@ function runMigrations(db: Database.Database): void {
       )
     `);
   } catch {}
+}
+
+function normalizeExistingFilePaths(db: Database.Database): void {
+  try {
+    const files = db.prepare('SELECT id, path FROM files').all() as Array<{ id: number; path: string }>;
+    if (files.length === 0) return;
+
+    const groups = new Map<string, Array<{ id: number; path: string; analyzed: number; functions: number }>>();
+    const countFunctions = db.prepare('SELECT COUNT(*) as count FROM functions WHERE file_id = ?');
+    const countAnalyzed = db.prepare('SELECT COUNT(*) as count FROM functions WHERE file_id = ? AND semantic_analyzed_at IS NOT NULL');
+
+    for (const file of files) {
+      const normalized = normalizeRepoPath(file.path);
+      const functions = (countFunctions.get(file.id) as { count: number }).count;
+      const analyzed = (countAnalyzed.get(file.id) as { count: number }).count;
+      const group = groups.get(normalized) ?? [];
+      group.push({ ...file, functions, analyzed });
+      groups.set(normalized, group);
+    }
+
+    db.transaction(() => {
+      for (const [normalized, group] of groups) {
+        group.sort((a, b) => b.analyzed - a.analyzed || b.functions - a.functions || a.id - b.id);
+        const keeper = group[0];
+        const duplicates = group.slice(1);
+
+        for (const duplicate of duplicates) {
+          db.prepare('DELETE FROM files WHERE id = ?').run(duplicate.id);
+        }
+
+        if (keeper.path !== normalized) {
+          db.prepare('UPDATE files SET path = ? WHERE id = ?').run(normalized, keeper.id);
+        }
+      }
+    })();
+  } catch {
+    // Tables may not exist yet during first-time initialization.
+  }
 }

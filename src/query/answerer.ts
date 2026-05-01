@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import type { LLMProvider } from '../providers/interface';
 import { estimateCost } from '../utils/tokens';
 
 export interface AnswerResult {
@@ -26,14 +26,13 @@ export async function generateAnswer(
   question: string,
   context: string,
   model: string,
-  apiKey: string
+  provider: LLMProvider
 ): Promise<AnswerResult> {
-  const client = new Anthropic({ apiKey });
   const startTime = Date.now();
 
-  const response = await client.messages.create({
+  const response = await provider.chat({
     model,
-    max_tokens: 1024,
+    maxTokens: 1024,
     system: SYSTEM_PROMPT,
     messages: [
       {
@@ -45,19 +44,11 @@ export async function generateAnswer(
 
   const responseTimeMs = Date.now() - startTime;
 
-  const answer = response.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as any).text)
-    .join('');
-
-  const inputTokens = response.usage?.input_tokens ?? 0;
-  const outputTokens = response.usage?.output_tokens ?? 0;
-
   return {
-    answer,
-    inputTokens,
-    outputTokens,
-    cost: estimateCost(model, inputTokens, outputTokens),
+    answer: response.text,
+    inputTokens: response.inputTokens,
+    outputTokens: response.outputTokens,
+    cost: estimateCost(model, response.inputTokens, response.outputTokens),
     responseTimeMs,
   };
 }

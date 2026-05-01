@@ -42,6 +42,7 @@ Respond ONLY with a JSON array, no markdown, no explanation:
 }
 
 export interface PromptType {
+  id: number;
   name: string;
   kind: string;
   full_text: string;
@@ -50,6 +51,7 @@ export interface PromptType {
 export function buildTypeAnalysisPrompt(types: PromptType[]): string {
   const typesBlock = types.map((t, i) => `
 Type ${i + 1}: ${t.name}
+ID: ${t.id}
 Kind: ${t.kind}
 Definition:
 \`\`\`typescript
@@ -64,6 +66,7 @@ ${typesBlock}
 Respond ONLY with a JSON array, no markdown, no explanation:
 [
   {
+    "id": 123,
     "name": "exact_name_from_above",
     "purpose": "One sentence describing what this type represents and how it's used"
   }
@@ -100,6 +103,7 @@ Respond ONLY with a JSON array, no markdown, no explanation:
 }
 
 export interface PromptFileSummary {
+  id: number;
   path: string;
   exports: string[];
   function_count: number;
@@ -111,6 +115,7 @@ export interface PromptFileSummary {
 export function buildFileSummaryPrompt(files: PromptFileSummary[]): string {
   const filesBlock = files.map((f, i) => `
 File ${i + 1}: ${f.path}
+ID: ${f.id}
 Exports: ${f.exports.length > 0 ? f.exports.join(', ') : 'none'}
 Stats: ${f.function_count} functions, ${f.type_count} types, ${f.route_count} routes, ${f.loc} LOC
 `).join('\n---\n');
@@ -122,6 +127,7 @@ ${filesBlock}
 Respond ONLY with a JSON array, no markdown, no explanation:
 [
   {
+    "id": 123,
     "path": "exact path",
     "purpose": "One sentence describing what this file is responsible for"
   }

@@ -7,8 +7,16 @@ export function estimateTokens(text: string): number {
 
 // Pricing per million tokens (as of 2025)
 const PRICING: Record<string, { input: number; output: number }> = {
+  // Anthropic
   'claude-haiku-4-5-20251001': { input: 0.80, output: 4.00 },
   'claude-sonnet-4-5-20250929': { input: 3.00, output: 15.00 },
+
+  // Gemini
+  'gemini-2.0-flash': { input: 0.10, output: 0.40 },
+  'gemini-2.5-pro-preview-06-05': { input: 1.25, output: 10.00 },
+
+  // OpenRouter (approximate — varies by underlying model)
+  'anthropic/claude-3.5-sonnet': { input: 3.00, output: 15.00 },
 };
 
 export function estimateCost(

@@ -4,7 +4,9 @@ import type Database from 'better-sqlite3';
 import {
   upsertFile, getFileByPath, insertFunction, getFunctionsByFileId,
   deleteFunctionsByFileId, deleteRelationshipsByCallerFunctionId,
+  getAllFiles, deleteFile,
   insertRelationship, getFunctionByName, enqueueForAnalysis,
+  copySemanticFields,
   resolveNullCallees, rebuildAllFtsIndexes,
   insertType, deleteTypesByFileId,
   insertRoute, deleteRoutesByFileId,
@@ -16,9 +18,11 @@ import { extractCallsFromFile } from './relationships';
 import { shouldReanalyze, getPriority } from './differ';
 import { scanDirectory } from './scanner';
 import { logger } from '../utils/logger';
+import { toRepoRelativePath } from '../utils/paths';
 
 export interface IngestResult {
   newFiles: number;
+  deletedFiles: number;
   changedFiles: number;
   unchangedFiles: number;
   totalFunctions: number;
@@ -36,11 +40,13 @@ export function ingestDirectory(
 ): IngestResult {
   const project = createProject(repoPath);
   const files = scanDirectory(repoPath);
+  const scannedRelativePaths = new Set(files.map(filePath => toRepoRelativePath(repoPath, filePath)));
 
   console.log(`Found ${files.length} TypeScript files.`);
 
   const result: IngestResult = {
     newFiles: 0,
+    deletedFiles: 0,
     changedFiles: 0,
     unchangedFiles: 0,
     totalFunctions: 0,
@@ -51,8 +57,17 @@ export function ingestDirectory(
     queued: 0,
   };
 
+  db.transaction(() => {
+    for (const existingFile of getAllFiles(db)) {
+      if (!scannedRelativePaths.has(existingFile.path)) {
+        deleteFile(db, existingFile.id);
+        result.deletedFiles++;
+      }
+    }
+  })();
+
   for (const filePath of files) {
-    const relativePath = path.relative(repoPath, filePath);
+    const relativePath = toRepoRelativePath(repoPath, filePath);
     const content = fs.readFileSync(filePath, 'utf-8');
     const contentHash = hashFileContent(content);
 
@@ -119,6 +134,8 @@ export function ingestDirectory(
           if (reanalyze) {
             enqueueForAnalysis(db, fnId, reason, getPriority(reason, fn.isExported));
             result.queued++;
+          } else {
+            copySemanticFields(db, fnId, oldFn);
           }
         }
       }
@@ -209,6 +226,7 @@ export function ingestDirectory(
 export function printIngestResult(result: IngestResult): void {
   console.log(`\nIngestion complete:`);
   console.log(`  New files:       ${result.newFiles}`);
+  console.log(`  Deleted files:   ${result.deletedFiles}`);
   console.log(`  Changed files:   ${result.changedFiles}`);
   console.log(`  Unchanged:       ${result.unchangedFiles}`);
   console.log(`  Functions:       ${result.totalFunctions}`);

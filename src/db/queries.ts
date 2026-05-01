@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { normalizeRepoPath } from '../utils/paths';
 
 // ── File queries ──
 
@@ -10,6 +11,7 @@ export interface FileRow {
 }
 
 export function upsertFile(db: Database.Database, filePath: string, contentHash: string): number {
+  filePath = normalizeRepoPath(filePath);
   const existing = db.prepare('SELECT id FROM files WHERE path = ?').get(filePath) as { id: number } | undefined;
   if (existing) {
     db.prepare(`
@@ -26,6 +28,7 @@ export function upsertFile(db: Database.Database, filePath: string, contentHash:
 }
 
 export function getFileByPath(db: Database.Database, filePath: string): FileRow | undefined {
+  filePath = normalizeRepoPath(filePath);
   return db.prepare('SELECT * FROM files WHERE path = ?').get(filePath) as FileRow | undefined;
 }
 
@@ -129,6 +132,32 @@ export function updateSemanticFields(
   );
 }
 
+export function copySemanticFields(
+  db: Database.Database,
+  toFunctionId: number,
+  fields: Pick<FunctionRow, 'purpose' | 'behavior_summary' | 'side_effects_json' | 'domain' | 'complexity' | 'semantic_analyzed_at'>
+): void {
+  if (!fields.semantic_analyzed_at) return;
+  db.prepare(`
+    UPDATE functions
+    SET purpose = ?,
+        behavior_summary = ?,
+        side_effects_json = ?,
+        domain = ?,
+        complexity = ?,
+        semantic_analyzed_at = ?
+    WHERE id = ?
+  `).run(
+    fields.purpose,
+    fields.behavior_summary,
+    fields.side_effects_json,
+    fields.domain,
+    fields.complexity,
+    fields.semantic_analyzed_at,
+    toFunctionId
+  );
+}
+
 // ── Relationship queries ──
 
 export interface RelationshipRow {
@@ -217,6 +246,20 @@ export function updateAnalysisStatus(
 export function getPendingAnalysisCount(db: Database.Database): number {
   const row = db.prepare('SELECT COUNT(*) as count FROM analysis_queue WHERE status = ?').get('pending') as any;
   return row.count;
+}
+
+export function enqueueUnanalyzedFunctions(db: Database.Database): number {
+  const result = db.prepare(`
+    INSERT INTO analysis_queue (function_id, priority, reason, status)
+    SELECT f.id, CASE WHEN f.is_exported = 1 THEN 6 ELSE 1 END, 'unanalyzed', 'pending'
+    FROM functions f
+    WHERE f.semantic_analyzed_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM analysis_queue q
+        WHERE q.function_id = f.id AND q.status = 'pending'
+      )
+  `).run();
+  return result.changes;
 }
 
 // ── Semantic Cache queries ──
