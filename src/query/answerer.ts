@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { createLlmClient, type LlmClientConfig } from '../utils/llm';
 import { estimateCost } from '../utils/tokens';
 
 export interface AnswerResult {
@@ -26,35 +26,22 @@ export async function generateAnswer(
   question: string,
   context: string,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<AnswerResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createLlmClient(llmConfig);
   const startTime = Date.now();
 
-  const response = await client.messages.create({
+  const { text, inputTokens, outputTokens } = await client.complete({
     model,
-    max_tokens: 1024,
+    maxTokens: 1024,
     system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `${context}\n\nQuestion: ${question}`,
-      },
-    ],
+    prompt: `${context}\n\nQuestion: ${question}`,
   });
 
   const responseTimeMs = Date.now() - startTime;
 
-  const answer = response.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as any).text)
-    .join('');
-
-  const inputTokens = response.usage?.input_tokens ?? 0;
-  const outputTokens = response.usage?.output_tokens ?? 0;
-
   return {
-    answer,
+    answer: text,
     inputTokens,
     outputTokens,
     cost: estimateCost(model, inputTokens, outputTokens),

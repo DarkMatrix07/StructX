@@ -4,7 +4,7 @@ import 'dotenv/config';
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getStructXDir, loadConfig, saveConfig, ensureStructxGitignored } from './config';
+import { getStructXDir, loadConfig, saveConfig, ensureStructxGitignored, getLlmConfig } from './config';
 import { initializeDatabase, openDatabase, getDbPath } from './db/connection';
 import { getStats, getFullOverview } from './db/queries';
 import { logger, setLogLevel } from './utils/logger';
@@ -37,19 +37,25 @@ program
   .command('setup')
   .description('One-step bootstrap: init + ingest + analyze')
   .argument('[repo-path]', 'Path to TypeScript repository', '.')
-  .option('--api-key <key>', 'Anthropic API key (overrides ANTHROPIC_API_KEY env var)')
-  .action(async (repoPath: string, opts: { apiKey?: string }) => {
+  .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
+  .option('--provider <name>', 'LLM provider: anthropic | openrouter', undefined)
+  .action(async (repoPath: string, opts: { apiKey?: string; provider?: string }) => {
     const resolved = path.resolve(repoPath);
     const structxDir = getStructXDir(resolved);
 
-    // Step 1: Init
+    // Step 1: Init — persist provider choice up front so loadConfig picks the
+    // right defaults (model names) on the very first run.
     const dbPath = getDbPath(structxDir);
     if (fs.existsSync(dbPath)) {
       console.log(`StructX already initialized at ${structxDir}`);
     } else {
       const db = initializeDatabase(dbPath);
       db.close();
-      saveConfig(structxDir, { repoPath: resolved });
+      const initial: any = { repoPath: resolved };
+      if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+        initial.provider = opts.provider;
+      }
+      saveConfig(structxDir, initial);
       console.log(`Initialized StructX at ${structxDir}`);
     }
     if (ensureStructxGitignored(resolved)) {
@@ -58,6 +64,9 @@ program
 
     // Step 2: Ingest
     const config = loadConfig(structxDir);
+    if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+      config.provider = opts.provider;
+    }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
     const db = openDatabase(dbPath);
 
@@ -87,7 +96,7 @@ program
         batchNum++;
         const items = pending.map(p => ({ id: p.id, function_id: p.function_id }));
         console.log(`  Batch ${batchNum}: ${items.length} functions...`);
-        const batchResult = await analyzeBatch(db, items, config.analysisModel, config.anthropicApiKey);
+        const batchResult = await analyzeBatch(db, items, config.analysisModel, getLlmConfig(config));
 
         totalAnalyzed += batchResult.analyzed;
         totalCached += batchResult.cached;
@@ -99,9 +108,9 @@ program
 
       // Analyze types, routes, and file summaries
       console.log('\n  Analyzing types, routes, and file summaries...');
-      const typeResult = await analyzeTypes(db, config.analysisModel, config.anthropicApiKey);
-      const routeResult = await analyzeRoutes(db, config.analysisModel, config.anthropicApiKey);
-      const fileResult = await analyzeFileSummaries(db, config.analysisModel, config.anthropicApiKey);
+      const typeResult = await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+      const routeResult = await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+      const fileResult = await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
 
       totalAnalyzed += typeResult.analyzed + routeResult.analyzed + fileResult.analyzed;
       totalFailed += typeResult.failed + routeResult.failed + fileResult.failed;
@@ -127,9 +136,9 @@ program
     } else if (config.anthropicApiKey) {
       // Still analyze types/routes/files even if no new functions
       console.log('\nAnalyzing types, routes, and file summaries...');
-      const typeResult = await analyzeTypes(db, config.analysisModel, config.anthropicApiKey);
-      const routeResult = await analyzeRoutes(db, config.analysisModel, config.anthropicApiKey);
-      const fileResult = await analyzeFileSummaries(db, config.analysisModel, config.anthropicApiKey);
+      const typeResult = await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+      const routeResult = await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+      const fileResult = await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
       const entityCount = typeResult.analyzed + routeResult.analyzed + fileResult.analyzed;
       if (entityCount > 0) {
         rebuildSearchIndex(db);
@@ -461,8 +470,9 @@ program
   .description('Run LLM semantic analysis on extracted functions')
   .argument('[repo-path]', 'Path to TypeScript repository', '.')
   .option('--yes', 'Skip cost confirmation prompt')
-  .option('--api-key <key>', 'Anthropic API key (overrides ANTHROPIC_API_KEY env var)')
-  .action(async (repoPath: string, opts: { yes?: boolean; apiKey?: string }) => {
+  .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
+  .option('--provider <name>', 'LLM provider: anthropic | openrouter')
+  .action(async (repoPath: string, opts: { yes?: boolean; apiKey?: string; provider?: string }) => {
     const resolved = path.resolve(repoPath);
     const structxDir = getStructXDir(resolved);
     const dbPath = getDbPath(structxDir);
@@ -473,10 +483,13 @@ program
     }
 
     const config = loadConfig(structxDir);
+    if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+      config.provider = opts.provider;
+    }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
     if (!config.anthropicApiKey) {
-      console.log('ERROR: Anthropic API key not set.');
-      console.log('Fix: Set ANTHROPIC_API_KEY env var, pass --api-key <key>, or add to .structx/config.json');
+      console.log(`ERROR: API key not set for provider '${config.provider}'.`);
+      console.log('Fix: set ANTHROPIC_API_KEY or OPENROUTER_API_KEY, pass --api-key <key>, or add to .structx/config.json');
       return;
     }
 
@@ -525,7 +538,7 @@ program
       const items = pending.map(p => ({ id: p.id, function_id: p.function_id }));
 
       console.log(`  Batch ${batchNum}: ${items.length} functions...`);
-      const batchResult = await analyzeBatch(db, items, config.analysisModel, config.anthropicApiKey);
+      const batchResult = await analyzeBatch(db, items, config.analysisModel, getLlmConfig(config));
 
       totalAnalyzed += batchResult.analyzed;
       totalCached += batchResult.cached;
@@ -537,9 +550,9 @@ program
 
     // Analyze types, routes, and file summaries
     console.log('\n  Analyzing types, routes, and file summaries...');
-    const typeResult = await analyzeTypes(db, config.analysisModel, config.anthropicApiKey);
-    const routeResult = await analyzeRoutes(db, config.analysisModel, config.anthropicApiKey);
-    const fileResult = await analyzeFileSummaries(db, config.analysisModel, config.anthropicApiKey);
+    const typeResult = await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+    const routeResult = await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+    const fileResult = await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
 
     totalAnalyzed += typeResult.analyzed + routeResult.analyzed + fileResult.analyzed;
     totalFailed += typeResult.failed + routeResult.failed + fileResult.failed;
@@ -566,8 +579,9 @@ program
   .description('Ask a question about the codebase')
   .argument('<question>', 'The question to ask')
   .option('--repo <path>', 'Path to TypeScript repository', '.')
-  .option('--api-key <key>', 'Anthropic API key (overrides ANTHROPIC_API_KEY env var)')
-  .action(async (question: string, opts: { repo: string; apiKey?: string }) => {
+  .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
+  .option('--provider <name>', 'LLM provider: anthropic | openrouter')
+  .action(async (question: string, opts: { repo: string; apiKey?: string; provider?: string }) => {
     const resolved = path.resolve(opts.repo);
     const structxDir = getStructXDir(resolved);
     const dbPath = getDbPath(structxDir);
@@ -576,9 +590,16 @@ program
     if (!fs.existsSync(dbPath)) {
       console.log('StructX not initialized. Running automatic setup...\n');
       const db = initializeDatabase(dbPath);
-      saveConfig(structxDir, { repoPath: resolved });
+      const initial: any = { repoPath: resolved };
+      if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+        initial.provider = opts.provider;
+      }
+      saveConfig(structxDir, initial);
       ensureStructxGitignored(resolved);
       const config = loadConfig(structxDir);
+      if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+        config.provider = opts.provider;
+      }
       if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
       const result = ingestDirectory(db, resolved, config.diffThreshold);
       printIngestResult(result);
@@ -594,11 +615,11 @@ program
             if (items.length === 0) break;
             batchNum++;
             console.log(`  Batch ${batchNum}: ${items.length} functions...`);
-            await analyzeBatch(db, items.map(p => ({ id: p.id, function_id: p.function_id })), config.analysisModel, config.anthropicApiKey);
+            await analyzeBatch(db, items.map(p => ({ id: p.id, function_id: p.function_id })), config.analysisModel, getLlmConfig(config));
           }
-          await analyzeTypes(db, config.analysisModel, config.anthropicApiKey);
-          await analyzeRoutes(db, config.analysisModel, config.anthropicApiKey);
-          await analyzeFileSummaries(db, config.analysisModel, config.anthropicApiKey);
+          await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+          await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+          await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
           rebuildSearchIndex(db);
         }
         console.log('Setup complete. Now answering your question...\n');
@@ -610,11 +631,14 @@ program
     }
 
     const config = loadConfig(structxDir);
+    if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+      config.provider = opts.provider;
+    }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
     if (!config.anthropicApiKey) {
-      console.log('ERROR: Anthropic API key not set.');
+      console.log(`ERROR: API key not set for provider '${config.provider}'.`);
       console.log('Fix one of:');
-      console.log('  1. Set ANTHROPIC_API_KEY environment variable');
+      console.log('  1. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY environment variable');
       console.log('  2. Pass --api-key <key> to this command');
       console.log('  3. Add "anthropicApiKey" to .structx/config.json');
       console.log('\nNote: "structx overview --repo ." works without an API key to see the codebase structure.');
@@ -635,11 +659,11 @@ program
         while (true) {
           const items = getPendingAnalysis(db, config.batchSize);
           if (items.length === 0) break;
-          await analyzeBatch(db, items.map(p => ({ id: p.id, function_id: p.function_id })), config.analysisModel, config.anthropicApiKey);
+          await analyzeBatch(db, items.map(p => ({ id: p.id, function_id: p.function_id })), config.analysisModel, getLlmConfig(config));
         }
-        await analyzeTypes(db, config.analysisModel, config.anthropicApiKey);
-        await analyzeRoutes(db, config.analysisModel, config.anthropicApiKey);
-        await analyzeFileSummaries(db, config.analysisModel, config.anthropicApiKey);
+        await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+        await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+        await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
         rebuildSearchIndex(db);
       }
       console.log('');
@@ -655,7 +679,7 @@ program
 
     // Step 1: Classify the question
     console.log('Classifying question...');
-    const classification = await classifyQuestion(question, config.classifierModel, config.anthropicApiKey);
+    const classification = await classifyQuestion(question, config.classifierModel, getLlmConfig(config));
     logger.debug('Classification', classification as any);
 
     // Step 2: Retrieve context
@@ -709,7 +733,7 @@ program
 
     // Step 4: Generate answer
     console.log('Generating answer...\n');
-    const answerResult = await generateAnswer(question, context, config.answerModel, config.anthropicApiKey);
+    const answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config));
 
     // Display answer
     const entityCount = retrieved.functions.length + retrieved.types.length +

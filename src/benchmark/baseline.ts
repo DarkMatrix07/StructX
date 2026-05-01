@@ -1,8 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
 import * as fs from 'fs';
 import * as path from 'path';
 import { scanDirectory } from '../ingest/scanner';
 import { estimateCost } from '../utils/tokens';
+import { createLlmClient, type LlmClientConfig } from '../utils/llm';
 
 export interface BaselineResult {
   answer: string;
@@ -17,9 +17,9 @@ export async function runBaseline(
   question: string,
   repoPath: string,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<BaselineResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createLlmClient(llmConfig);
 
   // Read all TypeScript files
   const files = scanDirectory(repoPath);
@@ -40,25 +40,15 @@ ${codeContext}
 Question: ${question}`;
 
   const startTime = Date.now();
-
-  const response = await client.messages.create({
+  const { text, inputTokens, outputTokens } = await client.complete({
     model,
-    max_tokens: 1024,
-    messages: [{ role: 'user', content: prompt }],
+    prompt,
+    maxTokens: 1024,
   });
-
   const responseTimeMs = Date.now() - startTime;
 
-  const answer = response.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as any).text)
-    .join('');
-
-  const inputTokens = response.usage?.input_tokens ?? 0;
-  const outputTokens = response.usage?.output_tokens ?? 0;
-
   return {
-    answer,
+    answer: text,
     inputTokens,
     outputTokens,
     cost: estimateCost(model, inputTokens, outputTokens),

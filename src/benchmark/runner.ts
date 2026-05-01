@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import type { StructXConfig } from '../config';
+import { getLlmConfig } from '../config';
 import { BENCHMARK_QUESTIONS } from './questions';
 import { runBaseline } from './baseline';
 import { classifyQuestion } from '../query/classifier';
@@ -47,7 +48,7 @@ export async function runBenchmark(
     // Run StructX agent
     try {
       console.log('  Running StructX agent...');
-      const classification = await classifyQuestion(question, config.classifierModel, config.anthropicApiKey);
+      const classification = await classifyQuestion(question, config.classifierModel, getLlmConfig(config));
 
       const graphQueryStart = Date.now();
       let retrieved;
@@ -73,7 +74,7 @@ export async function runBenchmark(
       const graphQueryTimeMs = Date.now() - graphQueryStart;
 
       const context = buildContext(retrieved, question);
-      const answerResult = await generateAnswer(question, context, config.answerModel, config.anthropicApiKey);
+      const answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config));
 
       result.structx = {
         answer: answerResult.answer,
@@ -108,7 +109,7 @@ export async function runBenchmark(
     // Run Traditional agent
     try {
       console.log('  Running Traditional agent...');
-      const baseline = await runBaseline(question, config.repoPath, config.answerModel, config.anthropicApiKey);
+      const baseline = await runBaseline(question, config.repoPath, config.answerModel, getLlmConfig(config));
 
       result.traditional = {
         answer: baseline.answer,

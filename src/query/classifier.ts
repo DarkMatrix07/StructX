@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { createLlmClient, type LlmClientConfig } from '../utils/llm';
 
 export type QueryStrategy = 'direct' | 'relationship' | 'semantic' | 'domain' | 'impact' | 'route' | 'type' | 'file' | 'list' | 'pattern';
 
@@ -46,22 +46,15 @@ Respond ONLY with JSON, no markdown:
 export async function classifyQuestion(
   question: string,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<ClassificationResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createLlmClient(llmConfig);
 
-  const response = await client.messages.create({
+  const { text } = await client.complete({
     model,
-    max_tokens: 200,
-    messages: [
-      { role: 'user', content: `${CLASSIFICATION_PROMPT}\n\nQuestion: "${question}"` },
-    ],
+    prompt: `${CLASSIFICATION_PROMPT}\n\nQuestion: "${question}"`,
+    maxTokens: 200,
   });
-
-  const text = response.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as any).text)
-    .join('');
 
   try {
     const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();

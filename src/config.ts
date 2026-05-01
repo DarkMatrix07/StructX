@@ -1,9 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { LlmClientConfig, LlmProvider } from './utils/llm';
 
 export interface StructXConfig {
   repoPath: string;
+  // Kept named anthropicApiKey for backwards compatibility with existing config.json
+  // files; the value is the API key for whichever provider is configured.
   anthropicApiKey: string;
+  provider: LlmProvider;
+  baseURL?: string;
   analysisModel: string;
   classifierModel: string;
   answerModel: string;
@@ -12,10 +17,20 @@ export interface StructXConfig {
   structxDir: string;
 }
 
-const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'structxDir'> = {
+const ANTHROPIC_DEFAULTS = {
   analysisModel: 'claude-haiku-4-5-20251001',
   classifierModel: 'claude-haiku-4-5-20251001',
   answerModel: 'claude-sonnet-4-5-20250929',
+};
+
+const OPENROUTER_DEFAULTS = {
+  // Sensible cheap-but-capable picks. Users can override per-project in config.json.
+  analysisModel: 'anthropic/claude-haiku-4.5',
+  classifierModel: 'anthropic/claude-haiku-4.5',
+  answerModel: 'anthropic/claude-sonnet-4.5',
+};
+
+const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'structxDir' | 'provider' | 'analysisModel' | 'classifierModel' | 'answerModel'> = {
   batchSize: 8,
   diffThreshold: 0.3,
 };
@@ -37,13 +52,37 @@ export function loadConfig(structxDir: string): StructXConfig {
   }
 
   const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-  const apiKey = raw.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '';
+
+  // Provider precedence: explicit config > env-var hint (OPENROUTER_API_KEY) > anthropic default.
+  // The key likewise falls back across env vars so existing setups keep working.
+  const provider: LlmProvider = raw.provider
+    ?? (process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY ? 'openrouter' : 'anthropic');
+
+  const envKey = provider === 'openrouter'
+    ? (process.env.OPENROUTER_API_KEY || process.env.ANTHROPIC_API_KEY || '')
+    : (process.env.ANTHROPIC_API_KEY || '');
+  const apiKey = raw.anthropicApiKey || envKey;
+
+  const providerDefaults = provider === 'openrouter' ? OPENROUTER_DEFAULTS : ANTHROPIC_DEFAULTS;
 
   return {
     ...DEFAULT_CONFIG,
+    ...providerDefaults,
     ...raw,
+    provider,
     anthropicApiKey: apiKey,
     structxDir,
+  };
+}
+
+// Build the LLM client config consumed by analyzer/classifier/answerer from a
+// loaded StructXConfig. Centralized so all three call sites stay in sync if
+// the provider list grows or new fields (organization, project) are added.
+export function getLlmConfig(config: StructXConfig): LlmClientConfig {
+  return {
+    provider: config.provider,
+    apiKey: config.anthropicApiKey,
+    baseURL: config.baseURL,
   };
 }
 

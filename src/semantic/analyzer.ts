@@ -1,5 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type Database from 'better-sqlite3';
+import { createLlmClient, type LlmClient, type LlmClientConfig } from '../utils/llm';
 import type { FunctionRow } from '../db/queries';
 import {
   getFunctionById, getCallees, getCallersByName,
@@ -31,9 +31,9 @@ export async function analyzeBatch(
   db: Database.Database,
   queueItems: Array<{ id: number; function_id: number }>,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<AnalyzeResult> {
-  const client = new Anthropic({ apiKey });
+  const client: LlmClient = createLlmClient(llmConfig);
   const result: AnalyzeResult = { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   // Build prompt functions from queue items
@@ -112,19 +112,14 @@ export async function analyzeBatch(
   let outputTokens = 0;
 
   try {
-    const response = await client.messages.create({
+    const out = await client.complete({
       model,
-      max_tokens: uncachedFunctions.length * 200,
-      messages: [{ role: 'user', content: batchPrompt }],
+      prompt: batchPrompt,
+      maxTokens: uncachedFunctions.length * 200,
     });
-
-    responseText = response.content
-      .filter(block => block.type === 'text')
-      .map(block => (block as any).text)
-      .join('');
-
-    inputTokens = response.usage?.input_tokens ?? 0;
-    outputTokens = response.usage?.output_tokens ?? 0;
+    responseText = out.text;
+    inputTokens = out.inputTokens;
+    outputTokens = out.outputTokens;
     result.totalInputTokens += inputTokens;
     result.totalOutputTokens += outputTokens;
     result.totalCost += estimateCost(model, inputTokens, outputTokens);
@@ -147,28 +142,20 @@ export async function analyzeBatch(
   if (!validation.valid && validation.results.length === 0) {
     logger.warn(`Validation failed, retrying. Errors: ${validation.errors.join('; ')}`);
     try {
-      const retryResponse = await client.messages.create({
+      const retry = await client.complete({
         model,
-        max_tokens: uncachedFunctions.length * 200,
-        messages: [
-          { role: 'user', content: batchPrompt },
-          { role: 'assistant', content: responseText },
-          { role: 'user', content: `Your previous response had JSON errors: ${validation.errors.join('; ')}. Please respond with ONLY a valid JSON array.` },
-        ],
+        prompt: batchPrompt,
+        maxTokens: uncachedFunctions.length * 200,
+        assistantPriorTurn: responseText,
+        retryUserMessage: `Your previous response had JSON errors: ${validation.errors.join('; ')}. Please respond with ONLY a valid JSON array.`,
       });
+      result.totalInputTokens += retry.inputTokens;
+      result.totalOutputTokens += retry.outputTokens;
+      result.totalCost += estimateCost(model, retry.inputTokens, retry.outputTokens);
 
-      const retryText = retryResponse.content
-        .filter(block => block.type === 'text')
-        .map(block => (block as any).text)
-        .join('');
-
-      result.totalInputTokens += retryResponse.usage?.input_tokens ?? 0;
-      result.totalOutputTokens += retryResponse.usage?.output_tokens ?? 0;
-      result.totalCost += estimateCost(model, retryResponse.usage?.input_tokens ?? 0, retryResponse.usage?.output_tokens ?? 0);
-
-      validation = validateSemanticResponse(retryText);
+      validation = validateSemanticResponse(retry.text);
       if (validation.valid || validation.results.length > 0) {
-        responseText = retryText;
+        responseText = retry.text;
       }
     } catch (retryErr: any) {
       logger.error(`Retry failed: ${retryErr.message}`);
@@ -235,9 +222,9 @@ export interface SimpleAnalyzeResult {
 export async function analyzeTypes(
   db: Database.Database,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<SimpleAnalyzeResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const types = getAllTypes(db).filter(t => !t.semantic_analyzed_at);
@@ -253,20 +240,15 @@ export async function analyzeTypes(
     })));
 
     try {
-      const response = await client.messages.create({
+      const { text, inputTokens, outputTokens } = await client.complete({
         model,
-        max_tokens: batch.length * 100,
-        messages: [{ role: 'user', content: prompt }],
+        prompt,
+        maxTokens: batch.length * 100,
       });
 
-      const text = response.content
-        .filter(block => block.type === 'text')
-        .map(block => (block as any).text)
-        .join('');
-
-      result.totalInputTokens += response.usage?.input_tokens ?? 0;
-      result.totalOutputTokens += response.usage?.output_tokens ?? 0;
-      result.totalCost += estimateCost(model, response.usage?.input_tokens ?? 0, response.usage?.output_tokens ?? 0);
+      result.totalInputTokens += inputTokens;
+      result.totalOutputTokens += outputTokens;
+      result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ name: string; purpose: string }>;
@@ -290,9 +272,9 @@ export async function analyzeTypes(
 export async function analyzeRoutes(
   db: Database.Database,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<SimpleAnalyzeResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const routes = getAllRoutes(db).filter(r => !r.semantic_analyzed_at);
@@ -307,20 +289,15 @@ export async function analyzeRoutes(
     })));
 
     try {
-      const response = await client.messages.create({
+      const { text, inputTokens, outputTokens } = await client.complete({
         model,
-        max_tokens: batch.length * 100,
-        messages: [{ role: 'user', content: prompt }],
+        prompt,
+        maxTokens: batch.length * 100,
       });
 
-      const text = response.content
-        .filter(block => block.type === 'text')
-        .map(block => (block as any).text)
-        .join('');
-
-      result.totalInputTokens += response.usage?.input_tokens ?? 0;
-      result.totalOutputTokens += response.usage?.output_tokens ?? 0;
-      result.totalCost += estimateCost(model, response.usage?.input_tokens ?? 0, response.usage?.output_tokens ?? 0);
+      result.totalInputTokens += inputTokens;
+      result.totalOutputTokens += outputTokens;
+      result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ method: string; path: string; purpose: string }>;
@@ -344,9 +321,9 @@ export async function analyzeRoutes(
 export async function analyzeFileSummaries(
   db: Database.Database,
   model: string,
-  apiKey: string
+  llmConfig: LlmClientConfig,
 ): Promise<SimpleAnalyzeResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const summaries = getAllFileSummaries(db).filter(s => !s.semantic_analyzed_at);
@@ -371,20 +348,15 @@ export async function analyzeFileSummaries(
     }));
 
     try {
-      const response = await client.messages.create({
+      const { text, inputTokens, outputTokens } = await client.complete({
         model,
-        max_tokens: batch.length * 100,
-        messages: [{ role: 'user', content: prompt }],
+        prompt,
+        maxTokens: batch.length * 100,
       });
 
-      const text = response.content
-        .filter(block => block.type === 'text')
-        .map(block => (block as any).text)
-        .join('');
-
-      result.totalInputTokens += response.usage?.input_tokens ?? 0;
-      result.totalOutputTokens += response.usage?.output_tokens ?? 0;
-      result.totalCost += estimateCost(model, response.usage?.input_tokens ?? 0, response.usage?.output_tokens ?? 0);
+      result.totalInputTokens += inputTokens;
+      result.totalOutputTokens += outputTokens;
+      result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ path: string; purpose: string }>;

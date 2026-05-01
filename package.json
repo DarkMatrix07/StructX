@@ -29,6 +29,7 @@
     "commander": "^14.0.3",
     "dotenv": "^17.2.4",
     "ignore": "^7.0.5",
+    "openai": "^6.35.0",
     "ts-morph": "^27.0.2"
   },
   "devDependencies": {
