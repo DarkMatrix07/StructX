@@ -4,7 +4,7 @@ import 'dotenv/config';
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getStructXDir, loadConfig, saveConfig } from './config';
+import { getStructXDir, loadConfig, saveConfig, ensureStructxGitignored } from './config';
 import { initializeDatabase, openDatabase, getDbPath } from './db/connection';
 import { getStats, getFullOverview } from './db/queries';
 import { logger, setLogLevel } from './utils/logger';
@@ -51,6 +51,9 @@ program
       db.close();
       saveConfig(structxDir, { repoPath: resolved });
       console.log(`Initialized StructX at ${structxDir}`);
+    }
+    if (ensureStructxGitignored(resolved)) {
+      console.log('Added .structx/ to .gitignore');
     }
 
     // Step 2: Ingest
@@ -190,6 +193,10 @@ program
       }
     }
 
+    if (ensureStructxGitignored(resolved)) {
+      console.log('Added .structx/ to .gitignore');
+    }
+
     console.log(`\nInstalled ${installed} instruction file(s) into ${resolved}`);
   });
 
@@ -216,6 +223,10 @@ program
     saveConfig(structxDir, {
       repoPath: resolved,
     });
+
+    if (ensureStructxGitignored(resolved)) {
+      console.log('Added .structx/ to .gitignore');
+    }
 
     console.log(`Initialized StructX at ${structxDir}`);
     console.log(`  Database: ${dbPath}`);
@@ -566,6 +577,7 @@ program
       console.log('StructX not initialized. Running automatic setup...\n');
       const db = initializeDatabase(dbPath);
       saveConfig(structxDir, { repoPath: resolved });
+      ensureStructxGitignored(resolved);
       const config = loadConfig(structxDir);
       if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
       const result = ingestDirectory(db, resolved, config.diffThreshold);

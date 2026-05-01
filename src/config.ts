@@ -47,6 +47,27 @@ export function loadConfig(structxDir: string): StructXConfig {
   };
 }
 
+// Add `.structx/` to the project's .gitignore so the local SQLite DB doesn't
+// get committed. Idempotent — checks for an existing entry under any common
+// spelling. Returns true when the file was modified.
+export function ensureStructxGitignored(repoPath: string): boolean {
+  const gitignorePath = path.join(repoPath, '.gitignore');
+
+  let existing = '';
+  if (fs.existsSync(gitignorePath)) {
+    existing = fs.readFileSync(gitignorePath, 'utf-8');
+    const lines = existing.split(/\r?\n/).map(l => l.trim());
+    if (lines.some(l => l === '.structx' || l === '.structx/' || l === '/.structx' || l === '/.structx/')) {
+      return false;
+    }
+  }
+
+  const block = (existing && !existing.endsWith('\n') ? '\n' : '')
+    + '\n# StructX local knowledge graph\n.structx/\n';
+  fs.appendFileSync(gitignorePath, block, 'utf-8');
+  return true;
+}
+
 export function saveConfig(structxDir: string, config: Partial<StructXConfig>): void {
   const configPath = getConfigPath(structxDir);
 
