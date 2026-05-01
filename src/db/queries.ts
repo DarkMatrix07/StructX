@@ -87,6 +87,18 @@ export function getFunctionByName(db: Database.Database, name: string): Function
   return db.prepare('SELECT * FROM functions WHERE name = ?').get(name) as FunctionRow | undefined;
 }
 
+// Resolve a callee name to a function id only when the name is unambiguous.
+// Returns null when zero or multiple functions share the name. This avoids
+// silently binding cross-file relationships to the wrong function during
+// name collisions (e.g. two `save` methods in different files).
+export function resolveUniqueCalleeFunctionId(db: Database.Database, name: string): number | null {
+  const rows = db.prepare(
+    'SELECT id FROM functions WHERE name = ? LIMIT 2'
+  ).all(name) as Array<{ id: number }>;
+  if (rows.length === 1) return rows[0].id;
+  return null;
+}
+
 export function getFunctionById(db: Database.Database, id: number): FunctionRow | undefined {
   return db.prepare('SELECT * FROM functions WHERE id = ?').get(id) as FunctionRow | undefined;
 }
@@ -388,11 +400,14 @@ export function getStats(db: Database.Database): Stats {
 // ── Callee resolution ──
 
 export function resolveNullCallees(db: Database.Database): number {
+  // Only bind a NULL relationship when the callee name resolves to exactly one
+  // function. Ambiguous names are left NULL so impact analysis doesn't return
+  // false positives for unrelated same-named functions.
   const result = db.prepare(`
     UPDATE relationships SET callee_function_id = (
       SELECT f.id FROM functions f WHERE f.name = relationships.callee_name LIMIT 1
     ) WHERE callee_function_id IS NULL
-      AND EXISTS (SELECT 1 FROM functions f WHERE f.name = relationships.callee_name)
+      AND (SELECT COUNT(*) FROM functions f WHERE f.name = relationships.callee_name) = 1
   `).run();
   return result.changes;
 }

@@ -4,7 +4,7 @@ import type Database from 'better-sqlite3';
 import {
   upsertFile, getFileByPath, insertFunction, getFunctionsByFileId,
   deleteFunctionsByFileId, deleteRelationshipsByCallerFunctionId,
-  insertRelationship, getFunctionByName, enqueueForAnalysis,
+  insertRelationship, resolveUniqueCalleeFunctionId, enqueueForAnalysis,
   resolveNullCallees, rebuildAllFtsIndexes,
   insertType, deleteTypesByFileId,
   insertRoute, deleteRoutesByFileId,
@@ -186,8 +186,12 @@ export function ingestDirectory(
           if (call.callerName === '__file__') continue;
           const callerId = functionIdMap.get(call.callerName);
           if (!callerId) continue;
-          const callee = getFunctionByName(db, call.calleeName);
-          insertRelationship(db, callerId, call.calleeName, call.relationType, callee?.id);
+          // In-file callers resolve to in-file functions when the name matches; cross-file
+          // resolution is left to the second-pass resolveNullCallees so we can require
+          // a globally-unique match before binding the FK.
+          const inFileId = functionIdMap.get(call.calleeName);
+          const calleeId = inFileId ?? resolveUniqueCalleeFunctionId(db, call.calleeName);
+          insertRelationship(db, callerId, call.calleeName, call.relationType, calleeId ?? undefined);
           result.totalRelationships++;
         }
       } catch (err: any) {
