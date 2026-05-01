@@ -91,6 +91,31 @@ export function getFunctionById(db: Database.Database, id: number): FunctionRow 
   return db.prepare('SELECT * FROM functions WHERE id = ?').get(id) as FunctionRow | undefined;
 }
 
+// Batch resolver — fetch only the names for a set of function ids in one round-trip.
+// Used by enrichers that previously called getFunctionById per caller (N+1).
+export function getFunctionNamesByIds(db: Database.Database, ids: number[]): Map<number, string> {
+  const out = new Map<number, string>();
+  if (ids.length === 0) return out;
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT id, name FROM functions WHERE id IN (${placeholders})`
+  ).all(...ids) as Array<{ id: number; name: string }>;
+  for (const r of rows) out.set(r.id, r.name);
+  return out;
+}
+
+// Batch resolver — fetch paths for a set of file ids in one round-trip.
+export function getFilePathsByIds(db: Database.Database, ids: number[]): Map<number, string> {
+  const out = new Map<number, string>();
+  if (ids.length === 0) return out;
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT id, path FROM files WHERE id IN (${placeholders})`
+  ).all(...ids) as Array<{ id: number; path: string }>;
+  for (const r of rows) out.set(r.id, r.path);
+  return out;
+}
+
 export function getFunctionsByFileId(db: Database.Database, fileId: number): FunctionRow[] {
   return db.prepare('SELECT * FROM functions WHERE file_id = ?').all(fileId) as FunctionRow[];
 }
