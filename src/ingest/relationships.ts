@@ -88,15 +88,74 @@ export function extractCallsFromFile(project: Project, filePath: string): Extrac
 }
 
 function extractCalleeName(callExpression: Node): string | null {
+  // ts-morph: a CallExpression's first child is its target expression.
   const expression = callExpression.getChildAtIndex(0);
   if (!expression) return null;
 
-  const text = expression.getText();
+  return resolveCalleeName(expression);
+}
 
-  // Handle property access: obj.method() -> "obj.method"
-  // Handle simple calls: foo() -> "foo"
-  // Skip complex expressions like foo()() or arr[0]()
-  if (text.includes('(') || text.includes('[')) return null;
+// Walk the call target to extract the most useful callee name. Handles:
+//   foo()                  -> "foo"
+//   obj.method()           -> "obj.method"
+//   a.b.c()                -> "a.b.c"
+//   db.prepare(...).get()  -> "get"           (chained — outer call uses inner result)
+//   obj['method']()        -> "obj.method"    (literal element access)
+//   arr[0]()               -> null            (computed, not statically resolvable)
+//   foo()()                -> null            (call returning a callable)
+//   (await foo)()          -> null
+//   new Foo().bar()        -> "Foo.bar"
+function resolveCalleeName(node: Node): string | null {
+  switch (node.getKind()) {
+    case SyntaxKind.Identifier:
+      return node.getText();
 
-  return text;
+    case SyntaxKind.PropertyAccessExpression: {
+      // obj.method — recurse on the object side, append .name
+      const expr = (node as any).getExpression?.() as Node | undefined;
+      const name = (node as any).getName?.() as string | undefined;
+      if (!name) return null;
+      const left = expr ? resolveCalleeName(expr) : null;
+      return left ? `${left}.${name}` : name;
+    }
+
+    case SyntaxKind.ElementAccessExpression: {
+      // obj['method'] — only resolve when the index is a string literal
+      const expr = (node as any).getExpression?.() as Node | undefined;
+      const arg = (node as any).getArgumentExpression?.() as Node | undefined;
+      if (!expr || !arg) return null;
+      if (arg.getKind() !== SyntaxKind.StringLiteral && arg.getKind() !== SyntaxKind.NoSubstitutionTemplateLiteral) {
+        return null;
+      }
+      const literal = arg.getText().slice(1, -1);
+      if (!/^[A-Za-z_$][\w$]*$/.test(literal)) return null;
+      const left = resolveCalleeName(expr);
+      return left ? `${left}.${literal}` : literal;
+    }
+
+    case SyntaxKind.NewExpression: {
+      const expr = (node as any).getExpression?.() as Node | undefined;
+      return expr ? resolveCalleeName(expr) : null;
+    }
+
+    case SyntaxKind.CallExpression: {
+      // Chained: foo().bar() — resolveCalleeName is called on `foo()` here, which means
+      // the outer node is `foo().bar` (handled in PropertyAccessExpression above) and we
+      // landed on the inner CallExpression `foo()`. The useful signal is the next .name,
+      // so return null to let the parent property-access produce just the right-hand name.
+      return null;
+    }
+
+    case SyntaxKind.NonNullExpression:
+    case SyntaxKind.ParenthesizedExpression:
+    case SyntaxKind.AsExpression:
+    case SyntaxKind.TypeAssertionExpression:
+    case SyntaxKind.SatisfiesExpression: {
+      const inner = (node as any).getExpression?.() as Node | undefined;
+      return inner ? resolveCalleeName(inner) : null;
+    }
+
+    default:
+      return null;
+  }
 }
