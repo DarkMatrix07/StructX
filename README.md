@@ -24,9 +24,9 @@ StructX supports three LLM providers. Set **any one** API key and it just works:
 |---------------------|----------|----------------|
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) | `claude-haiku-4-5` / `claude-sonnet-4-5` |
 | `GEMINI_API_KEY` | Google Generative AI (Gemini) | `gemini-2.0-flash` / `gemini-2.5-pro` |
-| `OPENROUTER_API_KEY` | OpenRouter (any model) | `anthropic/claude-3.5-sonnet` |
+| `OPENROUTER_API_KEY` | OpenRouter (any model) | `google/gemini-2.5-flash` |
 
-Detection priority: Anthropic > Gemini > OpenRouter. If multiple keys are set, the first match wins.
+Provider selection can be pinned in `.structx/config.json` with `"provider": "anthropic"`, `"provider": "gemini"`, or `"provider": "openrouter"`. If no provider is pinned, detection priority is Anthropic > Gemini > OpenRouter.
 
 Set the key in your environment or in a `.env` file in your project root:
 

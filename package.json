@@ -1,6 +1,6 @@
 {
   "name": "structx",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "main": "dist/cli.js",
   "bin": {
     "structx": "dist/cli.js"
@@ -30,6 +30,7 @@
     "commander": "^14.0.3",
     "dotenv": "^17.2.4",
     "openai": "^6.21.0",
+    "structx": "file:structx-3.0.1.tgz",
     "ts-morph": "^27.0.2"
   },
   "devDependencies": {

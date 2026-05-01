@@ -86,7 +86,7 @@ const program = new Command();
 program
   .name('structx')
   .description('Graph-powered code intelligence CLI for TypeScript')
-  .version('3.0.0')
+  .version('3.0.1')
   .option('--verbose', 'Enable verbose logging')
   .hook('preAction', (thisCommand) => {
     if (thisCommand.opts().verbose) {
