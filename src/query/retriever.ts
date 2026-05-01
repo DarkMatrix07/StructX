@@ -9,6 +9,7 @@ import {
   getConstantsByFileId, getFileOverview,
   searchFiles, getFileSummary, getFileByPath,
 } from '../db/queries';
+import { sanitizeFtsTerms, sanitizeFtsQuery } from '../utils/fts';
 
 export interface RetrievedContext {
   functions: RetrievedFunction[];
@@ -136,7 +137,8 @@ export function relationshipQuery(
 }
 
 export function semanticSearch(db: Database.Database, keywords: string[]): RetrievedContext {
-  const query = keywords.join(' OR ');
+  const query = sanitizeFtsTerms(keywords);
+  if (!query) return emptyContext('semantic');
   const functions = searchFunctions(db, query, 10);
   const types = searchTypes(db, query, 5);
   const routes = searchRoutes(db, query, 5);
@@ -221,8 +223,10 @@ export function routeQuery(db: Database.Database, routePath?: string | null, met
 export function typeQuery(db: Database.Database, typeName: string): RetrievedContext {
   const t = getTypeByName(db, typeName);
   if (!t) {
-    // Try FTS search
-    const results = searchTypes(db, typeName, 5);
+    // Try FTS search — sanitize so unusual characters in the type name don't crash MATCH.
+    const query = sanitizeFtsQuery(typeName);
+    if (!query) return emptyContext('type');
+    const results = searchTypes(db, query, 5);
     return {
       ...emptyContext('type'),
       types: results.map(r => enrichType(db, r)),
@@ -309,7 +313,8 @@ export function listQuery(db: Database.Database, entity: string | null): Retriev
 }
 
 export function patternQuery(db: Database.Database, keywords: string[]): RetrievedContext {
-  const query = keywords.join(' OR ');
+  const query = sanitizeFtsTerms(keywords);
+  if (!query) return emptyContext('pattern');
   const functions = searchFunctions(db, query, 15);
   const types = searchTypes(db, query, 10);
   const routes = searchRoutes(db, query, 10);
