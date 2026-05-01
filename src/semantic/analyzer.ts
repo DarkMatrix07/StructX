@@ -10,7 +10,7 @@ import {
   getAllFileSummaries, getAllFiles, updateFileSummaryPurpose,
 } from '../db/queries';
 import {
-  buildBatchPrompt, hashPrompt,
+  buildBatchPrompt, hashFunctionCacheKey,
   buildTypeAnalysisPrompt, buildRouteAnalysisPrompt, buildFileSummaryPrompt,
   type PromptFunction
 } from './prompt';
@@ -38,7 +38,7 @@ export async function analyzeBatch(
 
   // Build prompt functions from queue items
   const promptFunctions: PromptFunction[] = [];
-  const functionMap = new Map<string, { queueId: number; functionId: number }>();
+  const functionMap = new Map<string, { queueId: number; functionId: number; cacheKey: string }>();
 
   for (const item of queueItems) {
     const fn = getFunctionById(db, item.function_id);
@@ -68,25 +68,25 @@ export async function analyzeBatch(
       }),
     });
 
-    functionMap.set(fn.name, { queueId: item.id, functionId: fn.id });
+    functionMap.set(fn.name, {
+      queueId: item.id,
+      functionId: fn.id,
+      cacheKey: hashFunctionCacheKey(fn.code_hash, model),
+    });
   }
 
   if (promptFunctions.length === 0) return result;
 
-  const prompt = buildBatchPrompt(promptFunctions);
-  const promptHash = hashPrompt(prompt);
-
-  // Check cache for each function
+  // Per-function cache lookup — keyed by (code_hash, model, prompt_version) so cache hits
+  // survive different batch compositions.
   const uncachedFunctions: PromptFunction[] = [];
-  const cachedResults: SemanticResult[] = [];
 
   for (const pf of promptFunctions) {
     const mapping = functionMap.get(pf.function_name)!;
-    const cached = getCachedResponse(db, mapping.functionId, promptHash);
+    const cached = getCachedResponse(db, mapping.functionId, mapping.cacheKey);
     if (cached) {
       try {
         const parsed = JSON.parse(cached.response_json);
-        cachedResults.push(parsed);
         updateAnalysisStatus(db, mapping.queueId, 'done');
         applySemanticResult(db, mapping.functionId, parsed);
         result.cached++;
@@ -105,7 +105,6 @@ export async function analyzeBatch(
 
   // Build prompt for uncached functions only
   const batchPrompt = buildBatchPrompt(uncachedFunctions);
-  const batchPromptHash = hashPrompt(batchPrompt);
 
   // Call LLM
   let responseText: string;
@@ -187,9 +186,9 @@ export async function analyzeBatch(
     applySemanticResult(db, mapping.functionId, semanticResult);
     updateAnalysisStatus(db, mapping.queueId, 'done');
 
-    // Cache the result
+    // Cache the result keyed per-function so subsequent runs hit even if batched differently.
     insertCachedResponse(
-      db, mapping.functionId, batchPromptHash, model,
+      db, mapping.functionId, mapping.cacheKey, model,
       inputTokens, outputTokens, result.totalCost,
       JSON.stringify(semanticResult)
     );

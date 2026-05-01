@@ -131,3 +131,15 @@ Respond ONLY with a JSON array, no markdown, no explanation:
 export function hashPrompt(prompt: string): string {
   return crypto.createHash('sha256').update(prompt).digest('hex');
 }
+
+// Bump when the function-analysis prompt template or schema changes so old cache entries are skipped.
+export const FUNCTION_PROMPT_VERSION = 'v1';
+
+// Per-function cache key — independent of batch composition.
+// Same function code + model + prompt version = same cache hit, regardless of which other
+// functions were batched alongside it.
+export function hashFunctionCacheKey(codeHash: string, model: string, version = FUNCTION_PROMPT_VERSION): string {
+  return crypto.createHash('sha256')
+    .update(`${version}|${model}|${codeHash}`)
+    .digest('hex');
+}
