@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { LLMProvider } from '../providers/interface';
 import { scanDirectory } from '../ingest/scanner';
 import { estimateCost } from '../utils/tokens';
+import { createLlmClient, type LlmClientConfig } from '../utils/llm';
 
 export interface BaselineResult {
   answer: string;
@@ -17,8 +17,10 @@ export async function runBaseline(
   question: string,
   repoPath: string,
   model: string,
-  provider: LLMProvider
+  llmConfig: LlmClientConfig,
 ): Promise<BaselineResult> {
+  const client = createLlmClient(llmConfig);
+
   // Read all TypeScript files
   const files = scanDirectory(repoPath);
   let codeContext = '';
@@ -38,20 +40,18 @@ ${codeContext}
 Question: ${question}`;
 
   const startTime = Date.now();
-
-  const response = await provider.chat({
+  const { text, inputTokens, outputTokens } = await client.complete({
     model,
+    prompt,
     maxTokens: 1024,
-    messages: [{ role: 'user', content: prompt }],
   });
-
   const responseTimeMs = Date.now() - startTime;
 
   return {
-    answer: response.text,
-    inputTokens: response.inputTokens,
-    outputTokens: response.outputTokens,
-    cost: estimateCost(model, response.inputTokens, response.outputTokens),
+    answer: text,
+    inputTokens,
+    outputTokens,
+    cost: estimateCost(model, inputTokens, outputTokens),
     responseTimeMs,
     filesAccessed,
   };

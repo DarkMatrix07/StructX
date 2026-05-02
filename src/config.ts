@@ -1,13 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ProviderName } from './providers/factory';
+import type { LlmClientConfig, LlmProvider } from './utils/llm';
 
 export interface StructXConfig {
   repoPath: string;
+  // Kept named anthropicApiKey for backwards compatibility with existing config.json
+  // files; the value is the API key for whichever provider is configured.
   anthropicApiKey: string;
-  geminiApiKey: string;
-  openrouterApiKey: string;
-  provider: ProviderName | null;
+  provider: LlmProvider;
+  baseURL?: string;
   analysisModel: string;
   classifierModel: string;
   answerModel: string;
@@ -16,10 +17,20 @@ export interface StructXConfig {
   structxDir: string;
 }
 
-const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'geminiApiKey' | 'openrouterApiKey' | 'provider' | 'structxDir'> = {
+const ANTHROPIC_DEFAULTS = {
   analysisModel: 'claude-haiku-4-5-20251001',
   classifierModel: 'claude-haiku-4-5-20251001',
   answerModel: 'claude-sonnet-4-5-20250929',
+};
+
+const OPENROUTER_DEFAULTS = {
+  // Sensible cheap-but-capable picks. Users can override per-project in config.json.
+  analysisModel: 'anthropic/claude-haiku-4.5',
+  classifierModel: 'anthropic/claude-haiku-4.5',
+  answerModel: 'anthropic/claude-sonnet-4.5',
+};
+
+const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'structxDir' | 'provider' | 'analysisModel' | 'classifierModel' | 'answerModel'> = {
   batchSize: 8,
   diffThreshold: 0.3,
 };
@@ -41,19 +52,59 @@ export function loadConfig(structxDir: string): StructXConfig {
   }
 
   const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-  const apiKey = raw.anthropicApiKey || process.env.ANTHROPIC_API_KEY || '';
-  const geminiApiKey = raw.geminiApiKey || process.env.GEMINI_API_KEY || '';
-  const openrouterApiKey = raw.openrouterApiKey || process.env.OPENROUTER_API_KEY || '';
+
+  // Provider precedence: explicit config > env-var hint (OPENROUTER_API_KEY) > anthropic default.
+  // The key likewise falls back across env vars so existing setups keep working.
+  const provider: LlmProvider = raw.provider
+    ?? (process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY ? 'openrouter' : 'anthropic');
+
+  const envKey = provider === 'openrouter'
+    ? (process.env.OPENROUTER_API_KEY || process.env.ANTHROPIC_API_KEY || '')
+    : (process.env.ANTHROPIC_API_KEY || '');
+  const apiKey = raw.anthropicApiKey || envKey;
+
+  const providerDefaults = provider === 'openrouter' ? OPENROUTER_DEFAULTS : ANTHROPIC_DEFAULTS;
 
   return {
     ...DEFAULT_CONFIG,
+    ...providerDefaults,
     ...raw,
+    provider,
     anthropicApiKey: apiKey,
-    geminiApiKey,
-    openrouterApiKey,
-    provider: raw.provider || null,
     structxDir,
   };
+}
+
+// Build the LLM client config consumed by analyzer/classifier/answerer from a
+// loaded StructXConfig. Centralized so all three call sites stay in sync if
+// the provider list grows or new fields (organization, project) are added.
+export function getLlmConfig(config: StructXConfig): LlmClientConfig {
+  return {
+    provider: config.provider,
+    apiKey: config.anthropicApiKey,
+    baseURL: config.baseURL,
+  };
+}
+
+// Add `.structx/` to the project's .gitignore so the local SQLite DB doesn't
+// get committed. Idempotent — checks for an existing entry under any common
+// spelling. Returns true when the file was modified.
+export function ensureStructxGitignored(repoPath: string): boolean {
+  const gitignorePath = path.join(repoPath, '.gitignore');
+
+  let existing = '';
+  if (fs.existsSync(gitignorePath)) {
+    existing = fs.readFileSync(gitignorePath, 'utf-8');
+    const lines = existing.split(/\r?\n/).map(l => l.trim());
+    if (lines.some(l => l === '.structx' || l === '.structx/' || l === '/.structx' || l === '/.structx/')) {
+      return false;
+    }
+  }
+
+  const block = (existing && !existing.endsWith('\n') ? '\n' : '')
+    + '\n# StructX local knowledge graph\n.structx/\n';
+  fs.appendFileSync(gitignorePath, block, 'utf-8');
+  return true;
 }
 
 export function saveConfig(structxDir: string, config: Partial<StructXConfig>): void {
@@ -63,16 +114,10 @@ export function saveConfig(structxDir: string, config: Partial<StructXConfig>): 
     fs.mkdirSync(structxDir, { recursive: true });
   }
 
-  // Don't persist API keys to disk if they came from env
+  // Don't persist the API key to disk if it came from env
   const toSave = { ...config };
   if (process.env.ANTHROPIC_API_KEY && toSave.anthropicApiKey === process.env.ANTHROPIC_API_KEY) {
     delete toSave.anthropicApiKey;
-  }
-  if (process.env.GEMINI_API_KEY && toSave.geminiApiKey === process.env.GEMINI_API_KEY) {
-    delete toSave.geminiApiKey;
-  }
-  if (process.env.OPENROUTER_API_KEY && toSave.openrouterApiKey === process.env.OPENROUTER_API_KEY) {
-    delete toSave.openrouterApiKey;
   }
   delete toSave.structxDir;
 

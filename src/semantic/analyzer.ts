@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import type { LLMProvider } from '../providers/interface';
+import { createLlmClient, type LlmClient, type LlmClientConfig } from '../utils/llm';
 import type { FunctionRow } from '../db/queries';
 import {
   getFunctionById, getCallees, getCallersByName,
@@ -10,14 +10,13 @@ import {
   getAllFileSummaries, getAllFiles, updateFileSummaryPurpose,
 } from '../db/queries';
 import {
-  buildBatchPrompt, hashPrompt,
+  buildBatchPrompt, hashFunctionCacheKey,
   buildTypeAnalysisPrompt, buildRouteAnalysisPrompt, buildFileSummaryPrompt,
   type PromptFunction
 } from './prompt';
 import { validateSemanticResponse, type SemanticResult } from './validator';
 import { estimateCost } from '../utils/tokens';
 import { logger } from '../utils/logger';
-import { normalizeRepoPath, formatLocation } from '../utils/paths';
 
 export interface AnalyzeResult {
   analyzed: number;
@@ -32,13 +31,14 @@ export async function analyzeBatch(
   db: Database.Database,
   queueItems: Array<{ id: number; function_id: number }>,
   model: string,
-  provider: LLMProvider
+  llmConfig: LlmClientConfig,
 ): Promise<AnalyzeResult> {
+  const client: LlmClient = createLlmClient(llmConfig);
   const result: AnalyzeResult = { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   // Build prompt functions from queue items
   const promptFunctions: PromptFunction[] = [];
-  const functionMap = new Map<string, { queueId: number; functionId: number }>();
+  const functionMap = new Map<string, { queueId: number; functionId: number; cacheKey: string }>();
 
   for (const item of queueItems) {
     const fn = getFunctionById(db, item.function_id);
@@ -50,7 +50,7 @@ export async function analyzeBatch(
 
     // Get file path for location
     const file = db.prepare('SELECT path FROM files WHERE id = ?').get(fn.file_id) as any;
-    const location = file ? formatLocation(file.path, fn.start_line) : `unknown:${fn.start_line}`;
+    const location = file ? `${file.path}:${fn.start_line}` : `unknown:${fn.start_line}`;
 
     // Get calls
     const callees = getCallees(db, fn.id);
@@ -68,25 +68,25 @@ export async function analyzeBatch(
       }),
     });
 
-    functionMap.set(fn.name, { queueId: item.id, functionId: fn.id });
+    functionMap.set(fn.name, {
+      queueId: item.id,
+      functionId: fn.id,
+      cacheKey: hashFunctionCacheKey(fn.code_hash, model),
+    });
   }
 
   if (promptFunctions.length === 0) return result;
 
-  const prompt = buildBatchPrompt(promptFunctions);
-  const promptHash = hashPrompt(prompt);
-
-  // Check cache for each function
+  // Per-function cache lookup — keyed by (code_hash, model, prompt_version) so cache hits
+  // survive different batch compositions.
   const uncachedFunctions: PromptFunction[] = [];
-  const cachedResults: SemanticResult[] = [];
 
   for (const pf of promptFunctions) {
     const mapping = functionMap.get(pf.function_name)!;
-    const cached = getCachedResponse(db, mapping.functionId, promptHash);
+    const cached = getCachedResponse(db, mapping.functionId, mapping.cacheKey);
     if (cached) {
       try {
         const parsed = JSON.parse(cached.response_json);
-        cachedResults.push(parsed);
         updateAnalysisStatus(db, mapping.queueId, 'done');
         applySemanticResult(db, mapping.functionId, parsed);
         result.cached++;
@@ -105,7 +105,6 @@ export async function analyzeBatch(
 
   // Build prompt for uncached functions only
   const batchPrompt = buildBatchPrompt(uncachedFunctions);
-  const batchPromptHash = hashPrompt(batchPrompt);
 
   // Call LLM
   let responseText: string;
@@ -113,15 +112,14 @@ export async function analyzeBatch(
   let outputTokens = 0;
 
   try {
-    const response = await provider.chat({
+    const out = await client.complete({
       model,
+      prompt: batchPrompt,
       maxTokens: uncachedFunctions.length * 200,
-      messages: [{ role: 'user', content: batchPrompt }],
     });
-
-    responseText = response.text;
-    inputTokens = response.inputTokens;
-    outputTokens = response.outputTokens;
+    responseText = out.text;
+    inputTokens = out.inputTokens;
+    outputTokens = out.outputTokens;
     result.totalInputTokens += inputTokens;
     result.totalOutputTokens += outputTokens;
     result.totalCost += estimateCost(model, inputTokens, outputTokens);
@@ -144,23 +142,20 @@ export async function analyzeBatch(
   if (!validation.valid && validation.results.length === 0) {
     logger.warn(`Validation failed, retrying. Errors: ${validation.errors.join('; ')}`);
     try {
-      const retryResponse = await provider.chat({
+      const retry = await client.complete({
         model,
+        prompt: batchPrompt,
         maxTokens: uncachedFunctions.length * 200,
-        messages: [
-          { role: 'user', content: batchPrompt },
-          { role: 'assistant', content: responseText },
-          { role: 'user', content: `Your previous response had JSON errors: ${validation.errors.join('; ')}. Please respond with ONLY a valid JSON array.` },
-        ],
+        assistantPriorTurn: responseText,
+        retryUserMessage: `Your previous response had JSON errors: ${validation.errors.join('; ')}. Please respond with ONLY a valid JSON array.`,
       });
+      result.totalInputTokens += retry.inputTokens;
+      result.totalOutputTokens += retry.outputTokens;
+      result.totalCost += estimateCost(model, retry.inputTokens, retry.outputTokens);
 
-      result.totalInputTokens += retryResponse.inputTokens;
-      result.totalOutputTokens += retryResponse.outputTokens;
-      result.totalCost += estimateCost(model, retryResponse.inputTokens, retryResponse.outputTokens);
-
-      validation = validateSemanticResponse(retryResponse.text);
+      validation = validateSemanticResponse(retry.text);
       if (validation.valid || validation.results.length > 0) {
-        responseText = retryResponse.text;
+        responseText = retry.text;
       }
     } catch (retryErr: any) {
       logger.error(`Retry failed: ${retryErr.message}`);
@@ -178,9 +173,9 @@ export async function analyzeBatch(
     applySemanticResult(db, mapping.functionId, semanticResult);
     updateAnalysisStatus(db, mapping.queueId, 'done');
 
-    // Cache the result
+    // Cache the result keyed per-function so subsequent runs hit even if batched differently.
     insertCachedResponse(
-      db, mapping.functionId, batchPromptHash, model,
+      db, mapping.functionId, mapping.cacheKey, model,
       inputTokens, outputTokens, result.totalCost,
       JSON.stringify(semanticResult)
     );
@@ -227,8 +222,9 @@ export interface SimpleAnalyzeResult {
 export async function analyzeTypes(
   db: Database.Database,
   model: string,
-  provider: LLMProvider
+  llmConfig: LlmClientConfig,
 ): Promise<SimpleAnalyzeResult> {
+  const client = createLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const types = getAllTypes(db).filter(t => !t.semantic_analyzed_at);
@@ -238,30 +234,27 @@ export async function analyzeTypes(
   for (let i = 0; i < types.length; i += 10) {
     const batch = types.slice(i, i + 10);
     const prompt = buildTypeAnalysisPrompt(batch.map(t => ({
-      id: t.id,
       name: t.name,
       kind: t.kind,
       full_text: t.full_text,
     })));
 
     try {
-      const response = await provider.chat({
+      const { text, inputTokens, outputTokens } = await client.complete({
         model,
+        prompt,
         maxTokens: batch.length * 100,
-        messages: [{ role: 'user', content: prompt }],
       });
 
-      result.totalInputTokens += response.inputTokens;
-      result.totalOutputTokens += response.outputTokens;
-      result.totalCost += estimateCost(model, response.inputTokens, response.outputTokens);
+      result.totalInputTokens += inputTokens;
+      result.totalOutputTokens += outputTokens;
+      result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
-      const cleaned = response.text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
-      const parsed = JSON.parse(cleaned) as Array<{ id?: number; name: string; purpose: string }>;
+      const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
+      const parsed = JSON.parse(cleaned) as Array<{ name: string; purpose: string }>;
 
       for (const item of parsed) {
-        const typeRow = typeof item.id === 'number'
-          ? batch.find(t => t.id === item.id)
-          : batch.find(t => t.name === item.name);
+        const typeRow = batch.find(t => t.name === item.name);
         if (typeRow) {
           updateTypePurpose(db, typeRow.id, item.purpose);
           result.analyzed++;
@@ -279,8 +272,9 @@ export async function analyzeTypes(
 export async function analyzeRoutes(
   db: Database.Database,
   model: string,
-  provider: LLMProvider
+  llmConfig: LlmClientConfig,
 ): Promise<SimpleAnalyzeResult> {
+  const client = createLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const routes = getAllRoutes(db).filter(r => !r.semantic_analyzed_at);
@@ -295,17 +289,17 @@ export async function analyzeRoutes(
     })));
 
     try {
-      const response = await provider.chat({
+      const { text, inputTokens, outputTokens } = await client.complete({
         model,
+        prompt,
         maxTokens: batch.length * 100,
-        messages: [{ role: 'user', content: prompt }],
       });
 
-      result.totalInputTokens += response.inputTokens;
-      result.totalOutputTokens += response.outputTokens;
-      result.totalCost += estimateCost(model, response.inputTokens, response.outputTokens);
+      result.totalInputTokens += inputTokens;
+      result.totalOutputTokens += outputTokens;
+      result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
-      const cleaned = response.text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
+      const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ method: string; path: string; purpose: string }>;
 
       for (const item of parsed) {
@@ -327,15 +321,16 @@ export async function analyzeRoutes(
 export async function analyzeFileSummaries(
   db: Database.Database,
   model: string,
-  provider: LLMProvider
+  llmConfig: LlmClientConfig,
 ): Promise<SimpleAnalyzeResult> {
+  const client = createLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const summaries = getAllFileSummaries(db).filter(s => !s.semantic_analyzed_at);
   if (summaries.length === 0) return result;
 
   const allFiles = getAllFiles(db);
-  const fileMap = new Map(allFiles.map(f => [f.id, normalizeRepoPath(f.path)]));
+  const fileMap = new Map(allFiles.map(f => [f.id, f.path]));
 
   for (let i = 0; i < summaries.length; i += 10) {
     const batch = summaries.slice(i, i + 10);
@@ -343,7 +338,6 @@ export async function analyzeFileSummaries(
       let exports: string[] = [];
       try { if (s.exports_json) exports = JSON.parse(s.exports_json); } catch {}
       return {
-        id: s.id,
         path: fileMap.get(s.file_id) || 'unknown',
         exports,
         function_count: s.function_count,
@@ -354,24 +348,21 @@ export async function analyzeFileSummaries(
     }));
 
     try {
-      const response = await provider.chat({
+      const { text, inputTokens, outputTokens } = await client.complete({
         model,
+        prompt,
         maxTokens: batch.length * 100,
-        messages: [{ role: 'user', content: prompt }],
       });
 
-      result.totalInputTokens += response.inputTokens;
-      result.totalOutputTokens += response.outputTokens;
-      result.totalCost += estimateCost(model, response.inputTokens, response.outputTokens);
+      result.totalInputTokens += inputTokens;
+      result.totalOutputTokens += outputTokens;
+      result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
-      const cleaned = response.text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
-      const parsed = JSON.parse(cleaned) as Array<{ id?: number; path: string; purpose: string }>;
+      const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
+      const parsed = JSON.parse(cleaned) as Array<{ path: string; purpose: string }>;
 
       for (const item of parsed) {
-        const itemPath = normalizeRepoPath(item.path || '');
-        const summaryRow = typeof item.id === 'number'
-          ? batch.find(s => s.id === item.id)
-          : batch.find(s => fileMap.get(s.file_id) === itemPath);
+        const summaryRow = batch.find(s => fileMap.get(s.file_id) === item.path);
         if (summaryRow) {
           updateFileSummaryPurpose(db, summaryRow.id, item.purpose);
           result.analyzed++;

@@ -1,4 +1,4 @@
-import type { LLMProvider } from '../providers/interface';
+import { createLlmClient, type LlmClientConfig } from '../utils/llm';
 import { estimateCost } from '../utils/tokens';
 
 export interface AnswerResult {
@@ -26,29 +26,25 @@ export async function generateAnswer(
   question: string,
   context: string,
   model: string,
-  provider: LLMProvider
+  llmConfig: LlmClientConfig,
 ): Promise<AnswerResult> {
+  const client = createLlmClient(llmConfig);
   const startTime = Date.now();
 
-  const response = await provider.chat({
+  const { text, inputTokens, outputTokens } = await client.complete({
     model,
     maxTokens: 1024,
     system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `${context}\n\nQuestion: ${question}`,
-      },
-    ],
+    prompt: `${context}\n\nQuestion: ${question}`,
   });
 
   const responseTimeMs = Date.now() - startTime;
 
   return {
-    answer: response.text,
-    inputTokens: response.inputTokens,
-    outputTokens: response.outputTokens,
-    cost: estimateCost(model, response.inputTokens, response.outputTokens),
+    answer: text,
+    inputTokens,
+    outputTokens,
+    cost: estimateCost(model, inputTokens, outputTokens),
     responseTimeMs,
   };
 }

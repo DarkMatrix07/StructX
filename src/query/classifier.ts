@@ -1,5 +1,4 @@
-import type { LLMProvider } from '../providers/interface';
-import { normalizeRepoPath } from '../utils/paths';
+import { createLlmClient, type LlmClientConfig } from '../utils/llm';
 
 export type QueryStrategy = 'direct' | 'relationship' | 'semantic' | 'domain' | 'impact' | 'route' | 'type' | 'file' | 'list' | 'pattern';
 
@@ -44,120 +43,6 @@ Respond ONLY with JSON, no markdown:
   "list_entity": "functions|routes|types|files|constants or null"
 }`;
 
-const classifierCache = new Map<string, ClassificationResult>();
-
-export function classifyQuestionFastPath(question: string): ClassificationResult | null {
-  const q = question.trim();
-  const lower = q.toLowerCase();
-
-  const listEntity = matchListEntity(lower);
-  if (listEntity) {
-    return baseResult({ strategy: 'list', listEntity });
-  }
-
-  const filePath = extractFilePath(q);
-  if (filePath && /\b(what'?s|what is|show|list|inside|in|contents?)\b/i.test(q)) {
-    return baseResult({ strategy: 'file', filePath });
-  }
-
-  const routePath = q.match(/\b(GET|POST|PUT|DELETE|PATCH|ALL|USE)\s+(\/[^\s"'`?]+)/i);
-  if (routePath) {
-    return baseResult({ strategy: 'route', routeMethod: routePath[1].toUpperCase(), routePath: routePath[2] });
-  }
-  const bareRoute = q.match(/(?:route|endpoint)\s+(\/[^\s"'`?]+)/i) || q.match(/(\/api\/[^\s"'`?]+)/i);
-  if (bareRoute) {
-    return baseResult({ strategy: 'route', routePath: bareRoute[1] });
-  }
-
-  const impact = q.match(/\b(?:if i change|what breaks if i change|change impact for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i) ||
-    q.match(/\b(?:what is affected by|impact of|affected by)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
-  if (impact) {
-    return baseResult({ strategy: 'impact', functionName: cleanIdentifier(impact[1]) });
-  }
-
-  const direct = q.match(/\bwhat\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+do\b/i) ||
-    q.match(/\bexplain\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\b/i);
-  if (direct) {
-    return baseResult({ strategy: 'direct', functionName: cleanIdentifier(direct[1]) });
-  }
-
-  const callers = q.match(/\b(?:what|who|which functions?)\s+calls?\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i) ||
-    q.match(/\bcallers?\s+(?:of|for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
-  if (callers) {
-    return baseResult({ strategy: 'relationship', functionName: cleanIdentifier(callers[1]), direction: 'callers' });
-  }
-
-  const callees = q.match(/\bwhat\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+call\b/i) ||
-    q.match(/\bwhat\s+is\s+called\s+by\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
-  if (callees) {
-    return baseResult({ strategy: 'direct', functionName: cleanIdentifier(callees[1]) });
-  }
-
-  const typeName = q.match(/\b(?:type|interface|enum)\s+[`'"]?([A-Za-z_$][\w$]*)[`'"]?/i) ||
-    q.match(/\bwhat\s+is\s+the\s+[`'"]?([A-Z][\w$]*)[`'"]?\s+(?:type|interface|enum)\b/i);
-  if (typeName) {
-    return baseResult({ strategy: 'type', typeName: cleanIdentifier(typeName[1]) });
-  }
-
-  return null;
-}
-
-export async function classifyQuestion(
-  question: string,
-  model: string,
-  provider: LLMProvider
-): Promise<ClassificationResult> {
-  const fastPath = classifyQuestionFastPath(question);
-  if (fastPath) return fastPath;
-
-  const cacheKey = question.trim().toLowerCase();
-  const cached = classifierCache.get(cacheKey);
-  if (cached) return cached;
-
-  const response = await provider.chat({
-    model,
-    maxTokens: 200,
-    messages: [
-      { role: 'user', content: `${CLASSIFICATION_PROMPT}\n\nQuestion: "${question}"` },
-    ],
-  });
-
-  try {
-    const cleaned = response.text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
-    const parsed = JSON.parse(cleaned);
-    const result: ClassificationResult = {
-      strategy: normalizeStrategy(parsed.strategy),
-      functionName: parsed.function_name || null,
-      keywords: parsed.keywords || [],
-      domain: parsed.domain || null,
-      direction: parsed.direction || null,
-      typeName: parsed.type_name || null,
-      filePath: parsed.file_path || null,
-      routePath: parsed.route_path || null,
-      routeMethod: parsed.route_method || null,
-      listEntity: parsed.list_entity || null,
-    };
-    classifierCache.set(cacheKey, result);
-    return result;
-  } catch {
-    // Fallback to semantic search
-    const result: ClassificationResult = {
-      strategy: 'semantic',
-      functionName: null,
-      keywords: question.split(/\s+/).filter(w => w.length > 3),
-      domain: null,
-      direction: null,
-      typeName: null,
-      filePath: null,
-      routePath: null,
-      routeMethod: null,
-      listEntity: null,
-    };
-    classifierCache.set(cacheKey, result);
-    return result;
-  }
-}
-
 function baseResult(overrides: Partial<ClassificationResult>): ClassificationResult {
   return {
     strategy: 'semantic',
@@ -174,26 +59,149 @@ function baseResult(overrides: Partial<ClassificationResult>): ClassificationRes
   };
 }
 
+function cleanIdentifier(s: string): string {
+  return s.replace(/[`'"]/g, '').trim();
+}
+
+function extractFilePath(q: string): string | null {
+  const m = q.match(/\b([\w./\\-]+\.(?:ts|tsx|js|jsx))\b/i);
+  return m ? m[1] : null;
+}
+
 function matchListEntity(lower: string): string | null {
-  if (!/\b(list|show|what|which|all)\b/.test(lower)) return null;
-  if (/\b(routes?|endpoints?)\b/.test(lower)) return 'routes';
-  if (/\b(types?|interfaces?|enums?)\b/.test(lower)) return 'types';
-  if (/\bfiles?\b/.test(lower)) return 'files';
-  if (/\bfunctions?\b/.test(lower)) return 'functions';
-  if (/\bconstants?\b/.test(lower)) return 'constants';
+  if (/\b(all\s+)?routes?\b/.test(lower) && !/\bwhat\s+calls?\b/.test(lower)) return 'routes';
+  if (/\b(all\s+)?types?\b/.test(lower) && !/\bwhat\s+(?:is|are)\s+the\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'types';
+  if (/\b(all\s+)?(?:interfaces?|enums?)\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'types';
+  if (/\b(all\s+)?(?:files?|modules?)\b/.test(lower) && !/\bwhat(?:'s|\s+is)\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'files';
+  if (/\b(all\s+)?constants?\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'constants';
   return null;
 }
 
-function extractFilePath(question: string): string | null {
-  const match = question.match(/([A-Za-z0-9_.\-\\/]+\.tsx?)/);
-  return match ? normalizeRepoPath(match[1]) : null;
+// Priority order (high → low):
+//   1. Relationship (callers / callees / "depends on") — must beat list so
+//      "what functions call X" routes to relationship, not list.
+//   2. Impact — "what breaks if I change X"
+//   3. Direct — "what does X do"
+//   4. File — "what's in foo.ts"
+//   5. Route — explicit HTTP method or /api/... pattern
+//   6. Type — "what is the Foo type/interface"
+//   7. List — "list all routes / show all types"  (last, so it doesn't shadow above)
+export function classifyQuestionFastPath(question: string): ClassificationResult | null {
+  const q = question.trim();
+  const lower = q.toLowerCase();
+
+  // 1a. Callers — "what calls X", "which functions call X", "who calls X"
+  const callers =
+    q.match(/\b(?:what|who|which\s+functions?)\s+calls?\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i) ||
+    q.match(/\bcallers?\s+(?:of|for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
+  if (callers) {
+    return baseResult({ strategy: 'relationship', functionName: cleanIdentifier(callers[1]), direction: 'callers' });
+  }
+
+  // 1b. Callees — "what does X call", "what does X depend on", "what functions does X use"
+  const callees =
+    q.match(/\bwhat\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+(?:call|depend\s+on|use)\b/i) ||
+    q.match(/\bwhat\s+(?:functions?|methods?)\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+(?:call|use|depend\s+on)\b/i) ||
+    q.match(/\bdependencies\s+(?:of|for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
+  if (callees) {
+    return baseResult({ strategy: 'relationship', functionName: cleanIdentifier(callees[1]), direction: 'callees' });
+  }
+
+  // 2. Impact
+  const impact =
+    q.match(/\b(?:if\s+i\s+change|what\s+breaks\s+if\s+i\s+change|change\s+impact\s+for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i) ||
+    q.match(/\b(?:what\s+is\s+affected\s+by|impact\s+of|affected\s+by)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
+  if (impact) {
+    return baseResult({ strategy: 'impact', functionName: cleanIdentifier(impact[1]) });
+  }
+
+  // 3. Direct — "what does X do", "explain X"
+  const direct =
+    q.match(/\bwhat\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+do\b/i) ||
+    q.match(/\bexplain\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\b/i);
+  if (direct) {
+    return baseResult({ strategy: 'direct', functionName: cleanIdentifier(direct[1]) });
+  }
+
+  // 4. File
+  const filePath = extractFilePath(q);
+  if (filePath && /\b(what'?s|what\s+is|show|list|inside|in|contents?)\b/i.test(q)) {
+    return baseResult({ strategy: 'file', filePath });
+  }
+
+  // 5. Route — explicit HTTP verb + path, or bare /api/... reference
+  const routeWithMethod = q.match(/\b(GET|POST|PUT|DELETE|PATCH|ALL|USE)\s+(\/[^\s"'`?]+)/i);
+  if (routeWithMethod) {
+    return baseResult({ strategy: 'route', routeMethod: routeWithMethod[1].toUpperCase(), routePath: routeWithMethod[2] });
+  }
+  const bareRoute =
+    q.match(/(?:route|endpoint)\s+(\/[^\s"'`?]+)/i) ||
+    q.match(/(\/api\/[^\s"'`?]+)/i);
+  if (bareRoute) {
+    return baseResult({ strategy: 'route', routePath: bareRoute[1] });
+  }
+
+  // 6. Type
+  const typeName =
+    q.match(/\b(?:type|interface|enum)\s+[`'"]?([A-Za-z_$][\w$]*)[`'"]?/i) ||
+    q.match(/\bwhat\s+is\s+the\s+[`'"]?([A-Z][\w$]*)[`'"]?\s+(?:type|interface|enum)\b/i);
+  if (typeName) {
+    return baseResult({ strategy: 'type', typeName: cleanIdentifier(typeName[1]) });
+  }
+
+  // 7. List — checked last so it can't shadow relationship/callers patterns
+  const listEntity = matchListEntity(lower);
+  if (listEntity) {
+    return baseResult({ strategy: 'list', listEntity });
+  }
+
+  return null;
 }
 
-function cleanIdentifier(value: string): string {
-  return value.replace(/^[`'"]|[`'".,?!:;]+$/g, '');
-}
+export async function classifyQuestion(
+  question: string,
+  model: string,
+  llmConfig: LlmClientConfig,
+): Promise<ClassificationResult> {
+  const fastPath = classifyQuestionFastPath(question);
+  if (fastPath) return fastPath;
 
-function normalizeStrategy(value: unknown): QueryStrategy {
-  const strategies: QueryStrategy[] = ['direct', 'relationship', 'semantic', 'domain', 'impact', 'route', 'type', 'file', 'list', 'pattern'];
-  return strategies.includes(value as QueryStrategy) ? value as QueryStrategy : 'semantic';
+  const client = createLlmClient(llmConfig);
+
+  const { text } = await client.complete({
+    model,
+    prompt: `${CLASSIFICATION_PROMPT}\n\nQuestion: "${question}"`,
+    maxTokens: 200,
+  });
+
+  try {
+    const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
+    const parsed = JSON.parse(cleaned);
+    return {
+      strategy: parsed.strategy || 'semantic',
+      functionName: parsed.function_name || null,
+      keywords: parsed.keywords || [],
+      domain: parsed.domain || null,
+      direction: parsed.direction || null,
+      typeName: parsed.type_name || null,
+      filePath: parsed.file_path || null,
+      routePath: parsed.route_path || null,
+      routeMethod: parsed.route_method || null,
+      listEntity: parsed.list_entity || null,
+    };
+  } catch {
+    // Fallback to semantic search
+    return {
+      strategy: 'semantic',
+      functionName: null,
+      keywords: question.split(/\s+/).filter(w => w.length > 3),
+      domain: null,
+      direction: null,
+      typeName: null,
+      filePath: null,
+      routePath: null,
+      routeMethod: null,
+      listEntity: null,
+    };
+  }
 }

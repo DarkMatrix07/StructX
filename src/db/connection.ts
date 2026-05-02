@@ -80,6 +80,22 @@ function runMigrations(db: Database.Database): void {
       )
     `);
   } catch {}
+
+  // Ask response cache — keyed by SHA256(question + model) so identical
+  // questions with the same model return instantly without an LLM round-trip.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ask_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      question_hash TEXT NOT NULL UNIQUE,
+      strategy TEXT NOT NULL,
+      answer_text TEXT NOT NULL,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      cost_usd REAL,
+      model TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 }
 
 function normalizeExistingFilePaths(db: Database.Database): void {

@@ -90,8 +90,45 @@ export function getFunctionByName(db: Database.Database, name: string): Function
   return db.prepare('SELECT * FROM functions WHERE name = ?').get(name) as FunctionRow | undefined;
 }
 
+// Resolve a callee name to a function id only when the name is unambiguous.
+// Returns null when zero or multiple functions share the name. This avoids
+// silently binding cross-file relationships to the wrong function during
+// name collisions (e.g. two `save` methods in different files).
+export function resolveUniqueCalleeFunctionId(db: Database.Database, name: string): number | null {
+  const rows = db.prepare(
+    'SELECT id FROM functions WHERE name = ? LIMIT 2'
+  ).all(name) as Array<{ id: number }>;
+  if (rows.length === 1) return rows[0].id;
+  return null;
+}
+
 export function getFunctionById(db: Database.Database, id: number): FunctionRow | undefined {
   return db.prepare('SELECT * FROM functions WHERE id = ?').get(id) as FunctionRow | undefined;
+}
+
+// Batch resolver — fetch only the names for a set of function ids in one round-trip.
+// Used by enrichers that previously called getFunctionById per caller (N+1).
+export function getFunctionNamesByIds(db: Database.Database, ids: number[]): Map<number, string> {
+  const out = new Map<number, string>();
+  if (ids.length === 0) return out;
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT id, name FROM functions WHERE id IN (${placeholders})`
+  ).all(...ids) as Array<{ id: number; name: string }>;
+  for (const r of rows) out.set(r.id, r.name);
+  return out;
+}
+
+// Batch resolver — fetch paths for a set of file ids in one round-trip.
+export function getFilePathsByIds(db: Database.Database, ids: number[]): Map<number, string> {
+  const out = new Map<number, string>();
+  if (ids.length === 0) return out;
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT id, path FROM files WHERE id IN (${placeholders})`
+  ).all(...ids) as Array<{ id: number; path: string }>;
+  for (const r of rows) out.set(r.id, r.path);
+  return out;
 }
 
 export function getFunctionsByFileId(db: Database.Database, fileId: number): FunctionRow[] {
@@ -406,11 +443,14 @@ export function getStats(db: Database.Database): Stats {
 // ── Callee resolution ──
 
 export function resolveNullCallees(db: Database.Database): number {
+  // Only bind a NULL relationship when the callee name resolves to exactly one
+  // function. Ambiguous names are left NULL so impact analysis doesn't return
+  // false positives for unrelated same-named functions.
   const result = db.prepare(`
     UPDATE relationships SET callee_function_id = (
       SELECT f.id FROM functions f WHERE f.name = relationships.callee_name LIMIT 1
     ) WHERE callee_function_id IS NULL
-      AND EXISTS (SELECT 1 FROM functions f WHERE f.name = relationships.callee_name)
+      AND (SELECT COUNT(*) FROM functions f WHERE f.name = relationships.callee_name) = 1
   `).run();
   return result.changes;
 }
@@ -614,6 +654,28 @@ export function deleteConstantsByFileId(db: Database.Database, fileId: number): 
   db.prepare('DELETE FROM constants WHERE file_id = ?').run(fileId);
 }
 
+// Name-based search — constants have no FTS table, so we use a case-insensitive
+// LIKE on the name column. Sufficient because constant names are identifiers and
+// callers query by identifier substrings (e.g. "SESSION", "APP_VERSION").
+export function searchConstants(db: Database.Database, terms: string[], limit: number = 5): ConstantRow[] {
+  if (terms.length === 0) return [];
+  const rows: ConstantRow[] = [];
+  const seen = new Set<number>();
+  for (const term of terms) {
+    if (!term) continue;
+    const stripped = term.replace(/["]/g, '').trim();
+    if (!stripped) continue;
+    const hits = db.prepare(
+      'SELECT * FROM constants WHERE name LIKE ? LIMIT ?'
+    ).all(`%${stripped}%`, limit) as ConstantRow[];
+    for (const h of hits) {
+      if (!seen.has(h.id)) { seen.add(h.id); rows.push(h); }
+    }
+    if (rows.length >= limit) break;
+  }
+  return rows.slice(0, limit);
+}
+
 // ── File Summary queries ──
 
 export interface FileSummaryRow {
@@ -682,6 +744,43 @@ export function searchFiles(db: Database.Database, query: string, limit: number 
     WHERE files_fts MATCH ?
     LIMIT ?
   `).all(query, limit) as FileSummaryRow[];
+}
+
+// ── Ask response cache ──
+
+export interface AskCacheRow {
+  id: number;
+  question_hash: string;
+  strategy: string;
+  answer_text: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: number | null;
+  model: string | null;
+  created_at: string;
+}
+
+export function getCachedAskResponse(db: Database.Database, questionHash: string): AskCacheRow | undefined {
+  return db.prepare(
+    'SELECT * FROM ask_cache WHERE question_hash = ?'
+  ).get(questionHash) as AskCacheRow | undefined;
+}
+
+export function insertCachedAskResponse(
+  db: Database.Database,
+  questionHash: string,
+  strategy: string,
+  answerText: string,
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  costUsd: number,
+): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO ask_cache
+      (question_hash, strategy, answer_text, model, input_tokens, output_tokens, cost_usd)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(questionHash, strategy, answerText, model, inputTokens, outputTokens, costUsd);
 }
 
 // ── Rebuild all FTS indexes ──
