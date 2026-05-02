@@ -234,6 +234,7 @@ export async function analyzeTypes(
   for (let i = 0; i < types.length; i += 10) {
     const batch = types.slice(i, i + 10);
     const prompt = buildTypeAnalysisPrompt(batch.map(t => ({
+      id: t.id,
       name: t.name,
       kind: t.kind,
       full_text: t.full_text,
@@ -338,6 +339,7 @@ export async function analyzeFileSummaries(
       let exports: string[] = [];
       try { if (s.exports_json) exports = JSON.parse(s.exports_json); } catch {}
       return {
+        id: s.id,
         path: fileMap.get(s.file_id) || 'unknown',
         exports,
         function_count: s.function_count,
