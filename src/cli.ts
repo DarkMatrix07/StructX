@@ -19,6 +19,7 @@ import { generateAnswer } from './query/answerer';
 import { runBenchmark } from './benchmark/runner';
 import { generateMarkdownReport, generateCsvReport, saveReport } from './benchmark/reporter';
 import { ingestDirectory, printIngestResult } from './ingest/ingester';
+import { watchDirectory } from './watch/watcher';
 
 const program = new Command();
 
@@ -463,6 +464,46 @@ program
     if (ingestResult.queued > 0) {
       console.log(`\nNext: run 'structx analyze' to enrich functions with semantic metadata.`);
     }
+  });
+
+// ── watch ──
+program
+  .command('watch')
+  .description('Watch the repo for changes and incrementally update the graph')
+  .argument('[repo-path]', 'Path to TypeScript repository', '.')
+  .option('--no-initial-ingest', 'Skip the initial full scan before watching')
+  .action(async (repoPath: string, opts: { initialIngest?: boolean }) => {
+    const resolved = path.resolve(repoPath);
+    const structxDir = getStructXDir(resolved);
+    const dbPath = getDbPath(structxDir);
+
+    if (!fs.existsSync(dbPath)) {
+      console.log('StructX not initialized. Run "structx init" first.');
+      return;
+    }
+
+    const config = loadConfig(structxDir);
+    const db = openDatabase(dbPath);
+
+    if (opts.initialIngest !== false) {
+      console.log(`Initial scan of ${resolved}...`);
+      const result = ingestDirectory(db, resolved, config.diffThreshold);
+      printIngestResult(result);
+    }
+
+    const stop = await watchDirectory(db, resolved, { diffThreshold: config.diffThreshold });
+
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\nReceived ${signal}, shutting down...`);
+      await stop();
+      try { db.close(); } catch {}
+      process.exit(0);
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   });
 
 // ── analyze ──

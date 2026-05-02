@@ -5,8 +5,22 @@ import ignore, { type Ignore } from 'ignore';
 // Always-skipped directories. Acts as a safety floor when no .gitignore exists,
 // and as a hard backstop for paths we never want to ingest even if a project's
 // .gitignore is unusually permissive (e.g. `!node_modules/foo`).
-const ALWAYS_SKIP_DIRS = new Set(['node_modules', '.git', '.structx']);
-const TS_EXTENSIONS = new Set(['.ts', '.tsx']);
+export const ALWAYS_SKIP_DIRS = new Set(['node_modules', '.git', '.structx']);
+export const TS_EXTENSIONS = new Set(['.ts', '.tsx']);
+
+// Returns a matcher used by both `scanDirectory` and watch mode so the same
+// ignore rules apply during ingestion and incremental updates.
+export function loadIgnoreMatcher(rootPath: string): Ignore {
+  return loadGitignore(rootPath);
+}
+
+// True if a file path (absolute or relative) is a TypeScript source file we
+// want to ingest (matches `scanDirectory`'s extension + .d.ts rules).
+export function isIngestableTsFile(filePath: string): boolean {
+  const base = path.basename(filePath);
+  if (base.endsWith('.d.ts')) return false;
+  return TS_EXTENSIONS.has(path.extname(base));
+}
 
 export function scanDirectory(rootPath: string): string[] {
   const ig = loadGitignore(rootPath);
