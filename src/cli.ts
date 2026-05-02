@@ -4,13 +4,14 @@ import 'dotenv/config';
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { getStructXDir, loadConfig, saveConfig, ensureStructxGitignored, getLlmConfig } from './config';
 import { initializeDatabase, openDatabase, getDbPath } from './db/connection';
 import { getStats, getFullOverview } from './db/queries';
 import { logger, setLogLevel } from './utils/logger';
 import { analyzeBatch, rebuildSearchIndex, analyzeTypes, analyzeRoutes, analyzeFileSummaries } from './semantic/analyzer';
 import { estimateAnalysisCost, formatCostEstimate } from './semantic/cost';
-import { getPendingAnalysis, getPendingAnalysisCount, insertQaRun } from './db/queries';
+import { getPendingAnalysis, getPendingAnalysisCount, insertQaRun, getCachedAskResponse, insertCachedAskResponse } from './db/queries';
 import { classifyQuestion } from './query/classifier';
 import { directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
 import { buildContext } from './query/context-builder';
@@ -677,6 +678,24 @@ program
 
     const startTime = Date.now();
 
+    // Cache check — keyed by SHA256(question.normalized + answerModel) so
+    // identical questions with the same model return instantly.
+    const questionHash = crypto
+      .createHash('sha256')
+      .update(`${question.toLowerCase().trim()}|${config.answerModel}`)
+      .digest('hex');
+    const cached = getCachedAskResponse(db, questionHash);
+    if (cached) {
+      const entityCount = 0;
+      console.log('─'.repeat(60));
+      console.log(cached.answer_text);
+      console.log('─'.repeat(60));
+      console.log(`\nStrategy: ${cached.strategy} | Entities: ${entityCount} | Graph query: 0ms (cached)`);
+      console.log(`Tokens: ${cached.input_tokens ?? 0} in / ${cached.output_tokens ?? 0} out | Cost: $0.0000 (cached) | Time: ${Date.now() - startTime}ms`);
+      db.close();
+      return;
+    }
+
     // Step 1: Classify the question
     console.log('Classifying question...');
     const classification = await classifyQuestion(question, config.classifierModel, getLlmConfig(config));
@@ -743,6 +762,12 @@ program
     console.log('─'.repeat(60));
     console.log(`\nStrategy: ${classification.strategy} | Entities: ${entityCount} | Graph query: ${graphQueryTimeMs}ms`);
     console.log(`Tokens: ${answerResult.inputTokens} in / ${answerResult.outputTokens} out | Cost: $${answerResult.cost.toFixed(4)} | Time: ${answerResult.responseTimeMs}ms`);
+
+    // Store in ask cache so identical questions return instantly next time
+    insertCachedAskResponse(
+      db, questionHash, classification.strategy, answerResult.answer,
+      config.answerModel, answerResult.inputTokens, answerResult.outputTokens, answerResult.cost,
+    );
 
     // Save run to DB
     insertQaRun(db, {

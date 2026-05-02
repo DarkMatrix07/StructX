@@ -703,6 +703,43 @@ export function searchFiles(db: Database.Database, query: string, limit: number 
   `).all(query, limit) as FileSummaryRow[];
 }
 
+// ── Ask response cache ──
+
+export interface AskCacheRow {
+  id: number;
+  question_hash: string;
+  strategy: string;
+  answer_text: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: number | null;
+  model: string | null;
+  created_at: string;
+}
+
+export function getCachedAskResponse(db: Database.Database, questionHash: string): AskCacheRow | undefined {
+  return db.prepare(
+    'SELECT * FROM ask_cache WHERE question_hash = ?'
+  ).get(questionHash) as AskCacheRow | undefined;
+}
+
+export function insertCachedAskResponse(
+  db: Database.Database,
+  questionHash: string,
+  strategy: string,
+  answerText: string,
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  costUsd: number,
+): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO ask_cache
+      (question_hash, strategy, answer_text, model, input_tokens, output_tokens, cost_usd)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(questionHash, strategy, answerText, model, inputTokens, outputTokens, costUsd);
+}
+
 // ── Rebuild all FTS indexes ──
 
 export function rebuildAllFtsIndexes(db: Database.Database): void {
