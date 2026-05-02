@@ -43,11 +43,129 @@ Respond ONLY with JSON, no markdown:
   "list_entity": "functions|routes|types|files|constants or null"
 }`;
 
+function baseResult(overrides: Partial<ClassificationResult>): ClassificationResult {
+  return {
+    strategy: 'semantic',
+    functionName: null,
+    keywords: [],
+    domain: null,
+    direction: null,
+    typeName: null,
+    filePath: null,
+    routePath: null,
+    routeMethod: null,
+    listEntity: null,
+    ...overrides,
+  };
+}
+
+function cleanIdentifier(s: string): string {
+  return s.replace(/[`'"]/g, '').trim();
+}
+
+function extractFilePath(q: string): string | null {
+  const m = q.match(/\b([\w./\\-]+\.(?:ts|tsx|js|jsx))\b/i);
+  return m ? m[1] : null;
+}
+
+function matchListEntity(lower: string): string | null {
+  if (/\b(all\s+)?routes?\b/.test(lower) && !/\bwhat\s+calls?\b/.test(lower)) return 'routes';
+  if (/\b(all\s+)?types?\b/.test(lower) && !/\bwhat\s+(?:is|are)\s+the\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'types';
+  if (/\b(all\s+)?(?:interfaces?|enums?)\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'types';
+  if (/\b(all\s+)?(?:files?|modules?)\b/.test(lower) && !/\bwhat(?:'s|\s+is)\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'files';
+  if (/\b(all\s+)?constants?\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'constants';
+  return null;
+}
+
+// Priority order (high → low):
+//   1. Relationship (callers / callees / "depends on") — must beat list so
+//      "what functions call X" routes to relationship, not list.
+//   2. Impact — "what breaks if I change X"
+//   3. Direct — "what does X do"
+//   4. File — "what's in foo.ts"
+//   5. Route — explicit HTTP method or /api/... pattern
+//   6. Type — "what is the Foo type/interface"
+//   7. List — "list all routes / show all types"  (last, so it doesn't shadow above)
+export function classifyQuestionFastPath(question: string): ClassificationResult | null {
+  const q = question.trim();
+  const lower = q.toLowerCase();
+
+  // 1a. Callers — "what calls X", "which functions call X", "who calls X"
+  const callers =
+    q.match(/\b(?:what|who|which\s+functions?)\s+calls?\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i) ||
+    q.match(/\bcallers?\s+(?:of|for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
+  if (callers) {
+    return baseResult({ strategy: 'relationship', functionName: cleanIdentifier(callers[1]), direction: 'callers' });
+  }
+
+  // 1b. Callees — "what does X call", "what does X depend on", "what functions does X use"
+  const callees =
+    q.match(/\bwhat\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+(?:call|depend\s+on|use)\b/i) ||
+    q.match(/\bwhat\s+(?:functions?|methods?)\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+(?:call|use|depend\s+on)\b/i) ||
+    q.match(/\bdependencies\s+(?:of|for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
+  if (callees) {
+    return baseResult({ strategy: 'relationship', functionName: cleanIdentifier(callees[1]), direction: 'callees' });
+  }
+
+  // 2. Impact
+  const impact =
+    q.match(/\b(?:if\s+i\s+change|what\s+breaks\s+if\s+i\s+change|change\s+impact\s+for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i) ||
+    q.match(/\b(?:what\s+is\s+affected\s+by|impact\s+of|affected\s+by)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
+  if (impact) {
+    return baseResult({ strategy: 'impact', functionName: cleanIdentifier(impact[1]) });
+  }
+
+  // 3. Direct — "what does X do", "explain X"
+  const direct =
+    q.match(/\bwhat\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+do\b/i) ||
+    q.match(/\bexplain\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\b/i);
+  if (direct) {
+    return baseResult({ strategy: 'direct', functionName: cleanIdentifier(direct[1]) });
+  }
+
+  // 4. File
+  const filePath = extractFilePath(q);
+  if (filePath && /\b(what'?s|what\s+is|show|list|inside|in|contents?)\b/i.test(q)) {
+    return baseResult({ strategy: 'file', filePath });
+  }
+
+  // 5. Route — explicit HTTP verb + path, or bare /api/... reference
+  const routeWithMethod = q.match(/\b(GET|POST|PUT|DELETE|PATCH|ALL|USE)\s+(\/[^\s"'`?]+)/i);
+  if (routeWithMethod) {
+    return baseResult({ strategy: 'route', routeMethod: routeWithMethod[1].toUpperCase(), routePath: routeWithMethod[2] });
+  }
+  const bareRoute =
+    q.match(/(?:route|endpoint)\s+(\/[^\s"'`?]+)/i) ||
+    q.match(/(\/api\/[^\s"'`?]+)/i);
+  if (bareRoute) {
+    return baseResult({ strategy: 'route', routePath: bareRoute[1] });
+  }
+
+  // 6. Type
+  const typeName =
+    q.match(/\b(?:type|interface|enum)\s+[`'"]?([A-Za-z_$][\w$]*)[`'"]?/i) ||
+    q.match(/\bwhat\s+is\s+the\s+[`'"]?([A-Z][\w$]*)[`'"]?\s+(?:type|interface|enum)\b/i);
+  if (typeName) {
+    return baseResult({ strategy: 'type', typeName: cleanIdentifier(typeName[1]) });
+  }
+
+  // 7. List — checked last so it can't shadow relationship/callers patterns
+  const listEntity = matchListEntity(lower);
+  if (listEntity) {
+    return baseResult({ strategy: 'list', listEntity });
+  }
+
+  return null;
+}
+
 export async function classifyQuestion(
   question: string,
   model: string,
   llmConfig: LlmClientConfig,
 ): Promise<ClassificationResult> {
+  const fastPath = classifyQuestionFastPath(question);
+  if (fastPath) return fastPath;
+
   const client = createLlmClient(llmConfig);
 
   const { text } = await client.complete({
