@@ -383,9 +383,12 @@ export function listQuery(db: Database.Database, entity: string | null): Retriev
       break;
     }
     default: {
-      const fns = getAllFunctions(db).slice(0, 20);
+      // Unknown entity: return a compact cross-section so the LLM doesn't
+      // have to scan a bloated context. 10 fns + all routes + 10 types is
+      // enough for "what exists" questions without hitting the token budget.
+      const fns = getAllFunctions(db).slice(0, 10);
       const routes = getAllRoutes(db);
-      const types = getAllTypes(db).slice(0, 20);
+      const types = getAllTypes(db).slice(0, 10);
       const cache = buildEnrichCache(db, fns, types, routes);
       ctx.functions = fns.map(fn => enrichFunction(db, fn, cache));
       ctx.routes = routes.map(r => enrichRoute(db, r, cache));
