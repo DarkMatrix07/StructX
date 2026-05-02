@@ -7,7 +7,7 @@ import {
   getTypeByName, searchTypes, getAllTypes,
   getAllFunctions, getAllFiles, getAllFileSummaries,
   getConstantsByFileId, getFileOverview,
-  searchFiles, getFileSummary, getFileByPath,
+  searchFiles, searchConstants, getFileSummary, getFileByPath,
   getFunctionNamesByIds, getFilePathsByIds,
 } from '../db/queries';
 import { sanitizeFtsTerms, sanitizeFtsQuery } from '../utils/fts';
@@ -194,12 +194,14 @@ export function semanticSearch(db: Database.Database, keywords: string[]): Retri
   const functions = searchFunctions(db, query, 10);
   const types = searchTypes(db, query, 5);
   const routes = searchRoutes(db, query, 5);
-  const cache = buildEnrichCache(db, functions, types, routes);
+  const constants = searchConstants(db, keywords, 5);
+  const cache = buildEnrichCache(db, functions, types, routes, constants);
   return {
     ...emptyContext('semantic'),
     functions: functions.map(fn => enrichFunction(db, fn, cache)),
     types: types.map(t => enrichType(db, t, cache)),
     routes: routes.map(r => enrichRoute(db, r, cache)),
+    constants: constants.map(c => enrichConstant(db, c, cache)),
   };
 }
 
@@ -401,17 +403,19 @@ export function patternQuery(db: Database.Database, keywords: string[]): Retriev
   const functions = searchFunctions(db, query, 15);
   const types = searchTypes(db, query, 10);
   const routes = searchRoutes(db, query, 10);
+  const constants = searchConstants(db, keywords, 5);
   const fileSummaries = searchFiles(db, query, 5);
 
   const allFileRows = getAllFiles(db);
   const fileMap = new Map(allFileRows.map(f => [f.id, f.path]));
-  const cache = buildEnrichCache(db, functions, types, routes);
+  const cache = buildEnrichCache(db, functions, types, routes, constants);
 
   return {
     ...emptyContext('pattern'),
     functions: functions.map(fn => enrichFunction(db, fn, cache)),
     types: types.map(t => enrichType(db, t, cache)),
     routes: routes.map(r => enrichRoute(db, r, cache)),
+    constants: constants.map(c => enrichConstant(db, c, cache)),
     files: fileSummaries.map(s => enrichFileSummary(fileMap.get(s.file_id) || 'unknown', s)),
   };
 }

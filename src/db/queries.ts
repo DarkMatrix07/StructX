@@ -611,6 +611,28 @@ export function deleteConstantsByFileId(db: Database.Database, fileId: number): 
   db.prepare('DELETE FROM constants WHERE file_id = ?').run(fileId);
 }
 
+// Name-based search — constants have no FTS table, so we use a case-insensitive
+// LIKE on the name column. Sufficient because constant names are identifiers and
+// callers query by identifier substrings (e.g. "SESSION", "APP_VERSION").
+export function searchConstants(db: Database.Database, terms: string[], limit: number = 5): ConstantRow[] {
+  if (terms.length === 0) return [];
+  const rows: ConstantRow[] = [];
+  const seen = new Set<number>();
+  for (const term of terms) {
+    if (!term) continue;
+    const stripped = term.replace(/["]/g, '').trim();
+    if (!stripped) continue;
+    const hits = db.prepare(
+      'SELECT * FROM constants WHERE name LIKE ? LIMIT ?'
+    ).all(`%${stripped}%`, limit) as ConstantRow[];
+    for (const h of hits) {
+      if (!seen.has(h.id)) { seen.add(h.id); rows.push(h); }
+    }
+    if (rows.length >= limit) break;
+  }
+  return rows.slice(0, limit);
+}
+
 // ── File Summary queries ──
 
 export interface FileSummaryRow {
