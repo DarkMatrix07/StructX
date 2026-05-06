@@ -5,7 +5,18 @@ import ignore, { type Ignore } from 'ignore';
 // Always-skipped directories. Acts as a safety floor when no .gitignore exists,
 // and as a hard backstop for paths we never want to ingest even if a project's
 // .gitignore is unusually permissive (e.g. `!node_modules/foo`).
-export const ALWAYS_SKIP_DIRS = new Set(['node_modules', '.git', '.structx']);
+export const ALWAYS_SKIP_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.structx',
+  '.claude',
+  '.codex',
+  '.agents',
+  '.cursor',
+  '.worktrees',
+  'tmp',
+  'temp',
+]);
 export const TS_EXTENSIONS = new Set(['.ts', '.tsx']);
 
 // Returns a matcher used by both `scanDirectory` and watch mode so the same

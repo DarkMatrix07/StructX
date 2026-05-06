@@ -64,15 +64,36 @@ export function loadConfig(structxDir: string): StructXConfig {
   const apiKey = raw.anthropicApiKey || envKey;
 
   const providerDefaults = provider === 'openrouter' ? OPENROUTER_DEFAULTS : ANTHROPIC_DEFAULTS;
+  const repoPath = resolveConfiguredRepoPath(raw.repoPath, structxDir);
 
   return {
     ...DEFAULT_CONFIG,
     ...providerDefaults,
     ...raw,
+    repoPath,
     provider,
+    classifierModel: raw.classifierModel ?? raw.queryModel ?? providerDefaults.classifierModel,
+    answerModel: raw.answerModel ?? raw.queryModel ?? providerDefaults.answerModel,
     anthropicApiKey: apiKey,
     structxDir,
   };
+}
+
+function resolveConfiguredRepoPath(rawRepoPath: string | undefined, structxDir: string): string {
+  const fallback = path.dirname(structxDir);
+  if (!rawRepoPath) return fallback;
+  if (fs.existsSync(rawRepoPath)) return path.resolve(rawRepoPath);
+
+  // Repair legacy Windows drive-relative paths such as "E:StructX-demo" that
+  // should have been persisted as "E:\\StructX-demo".
+  if (/^[A-Za-z]:[^\\/]/.test(rawRepoPath)) {
+    const repaired = `${rawRepoPath.slice(0, 2)}\\${rawRepoPath.slice(2)}`;
+    if (fs.existsSync(repaired)) return path.resolve(repaired);
+  }
+
+  const resolved = path.resolve(rawRepoPath);
+  if (fs.existsSync(resolved)) return resolved;
+  return fallback;
 }
 
 // Build the LLM client config consumed by analyzer/classifier/answerer from a

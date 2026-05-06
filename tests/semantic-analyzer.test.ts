@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { LLMProvider } from '../src/providers/interface';
+import type { LlmClient } from '../src/utils/llm';
 import { initializeDatabase } from '../src/db/connection';
 import { insertType, upsertFile, upsertFileSummary } from '../src/db/queries';
 import { analyzeFileSummaries, analyzeTypes } from '../src/semantic/analyzer';
@@ -45,8 +45,9 @@ describe('semantic analyzer entity matching', () => {
       start_line: 1,
       end_line: 1,
     });
-    const provider: LLMProvider = {
-      async chat() {
+    const provider: LlmClient = {
+      provider: 'openrouter',
+      async complete() {
         return {
           text: JSON.stringify([
             { id: typeA, name: 'MockApp', purpose: 'First mock app type.' },
@@ -84,8 +85,9 @@ describe('semantic analyzer entity matching', () => {
       imports_json: JSON.stringify([]),
       exports_json: JSON.stringify(['login']),
     });
-    const provider: LLMProvider = {
-      async chat() {
+    const provider: LlmClient = {
+      provider: 'openrouter',
+      async complete() {
         return {
           text: JSON.stringify([
             { path: 'src\\index.ts', purpose: 'Main entry point.' },

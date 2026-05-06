@@ -1,4 +1,6 @@
 import { createLlmClient, type LlmClientConfig } from '../utils/llm';
+import { estimateCost } from '../utils/tokens';
+import { normalizeRepoPath } from '../utils/paths';
 
 export type QueryStrategy = 'direct' | 'relationship' | 'semantic' | 'domain' | 'impact' | 'route' | 'type' | 'file' | 'list' | 'pattern';
 
@@ -13,6 +15,14 @@ export interface ClassificationResult {
   routePath: string | null;
   routeMethod: string | null;
   listEntity: string | null;
+}
+
+export interface ClassificationWithUsage {
+  classification: ClassificationResult;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  usedLlm: boolean;
 }
 
 const CLASSIFICATION_PROMPT = `You are a question classifier for a code intelligence system. Given a developer's question about a TypeScript codebase, classify it into exactly one category and extract key parameters.
@@ -65,7 +75,7 @@ function cleanIdentifier(s: string): string {
 
 function extractFilePath(q: string): string | null {
   const m = q.match(/\b([\w./\\-]+\.(?:ts|tsx|js|jsx))\b/i);
-  return m ? m[1] : null;
+  return m ? normalizeRepoPath(m[1]) : null;
 }
 
 function matchListEntity(lower: string): string | null {
@@ -104,7 +114,10 @@ export function classifyQuestionFastPath(question: string): ClassificationResult
     q.match(/\bwhat\s+(?:functions?|methods?)\s+does\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?\s+(?:call|use|depend\s+on)\b/i) ||
     q.match(/\bdependencies\s+(?:of|for)\s+[`'"]?([A-Za-z_$][\w.$]*)[`'"]?/i);
   if (callees) {
-    return baseResult({ strategy: 'relationship', functionName: cleanIdentifier(callees[1]), direction: 'callees' });
+    const functionName = cleanIdentifier(callees[1]);
+    if (!['it', 'this', 'that'].includes(functionName.toLowerCase())) {
+      return baseResult({ strategy: 'direct', functionName });
+    }
   }
 
   // 2. Impact
@@ -127,6 +140,15 @@ export function classifyQuestionFastPath(question: string): ClassificationResult
   const filePath = extractFilePath(q);
   if (filePath && /\b(what'?s|what\s+is|show|list|inside|in|contents?)\b/i.test(q)) {
     return baseResult({ strategy: 'file', filePath });
+  }
+
+  const conceptFiles = q.match(/\bwhat\s+(?:files?|modules?)\s+(?:implement|handle|contain|use|define|support)\s+(.+?)\??$/i);
+  if (conceptFiles) {
+    const keywords = conceptFiles[1]
+      .split(/\s+/)
+      .map(w => w.replace(/[^A-Za-z0-9_$-]/g, '').trim())
+      .filter(w => w.length > 2);
+    return baseResult({ strategy: 'pattern', keywords });
   }
 
   // 5. Route — explicit HTTP verb + path, or bare /api/... reference
@@ -163,45 +185,75 @@ export async function classifyQuestion(
   model: string,
   llmConfig: LlmClientConfig,
 ): Promise<ClassificationResult> {
+  const result = await classifyQuestionWithUsage(question, model, llmConfig);
+  return result.classification;
+}
+
+export async function classifyQuestionWithUsage(
+  question: string,
+  model: string,
+  llmConfig: LlmClientConfig,
+): Promise<ClassificationWithUsage> {
   const fastPath = classifyQuestionFastPath(question);
-  if (fastPath) return fastPath;
+  if (fastPath) {
+    return {
+      classification: fastPath,
+      inputTokens: 0,
+      outputTokens: 0,
+      cost: 0,
+      usedLlm: false,
+    };
+  }
 
   const client = createLlmClient(llmConfig);
 
-  const { text } = await client.complete({
+  const { text, inputTokens, outputTokens } = await client.complete({
     model,
     prompt: `${CLASSIFICATION_PROMPT}\n\nQuestion: "${question}"`,
     maxTokens: 200,
   });
+  const cost = estimateCost(model, inputTokens, outputTokens);
 
   try {
     const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
     const parsed = JSON.parse(cleaned);
     return {
-      strategy: parsed.strategy || 'semantic',
-      functionName: parsed.function_name || null,
-      keywords: parsed.keywords || [],
-      domain: parsed.domain || null,
-      direction: parsed.direction || null,
-      typeName: parsed.type_name || null,
-      filePath: parsed.file_path || null,
-      routePath: parsed.route_path || null,
-      routeMethod: parsed.route_method || null,
-      listEntity: parsed.list_entity || null,
+      classification: {
+        strategy: parsed.strategy || 'semantic',
+        functionName: parsed.function_name || null,
+        keywords: parsed.keywords || [],
+        domain: parsed.domain || null,
+        direction: parsed.direction || null,
+        typeName: parsed.type_name || null,
+        filePath: parsed.file_path || null,
+        routePath: parsed.route_path || null,
+        routeMethod: parsed.route_method || null,
+        listEntity: parsed.list_entity || null,
+      },
+      inputTokens,
+      outputTokens,
+      cost,
+      usedLlm: true,
     };
   } catch {
     // Fallback to semantic search
     return {
-      strategy: 'semantic',
-      functionName: null,
-      keywords: question.split(/\s+/).filter(w => w.length > 3),
-      domain: null,
-      direction: null,
-      typeName: null,
-      filePath: null,
-      routePath: null,
-      routeMethod: null,
-      listEntity: null,
+      classification: {
+        strategy: 'semantic',
+        functionName: null,
+        keywords: question.split(/\s+/).filter(w => w.length > 3),
+        domain: null,
+        direction: null,
+        typeName: null,
+        filePath: null,
+        routePath: null,
+        routeMethod: null,
+        listEntity: null,
+      },
+      inputTokens,
+      outputTokens,
+      cost,
+      usedLlm: true,
     };
   }
 }

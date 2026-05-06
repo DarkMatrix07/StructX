@@ -81,8 +81,8 @@ function runMigrations(db: Database.Database): void {
     `);
   } catch {}
 
-  // Ask response cache — keyed by SHA256(question + model) so identical
-  // questions with the same model return instantly without an LLM round-trip.
+  // Ask response cache. Callers compute the key from question + answer model +
+  // graph fingerprint so changed code cannot return stale answers.
   db.exec(`
     CREATE TABLE IF NOT EXISTS ask_cache (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

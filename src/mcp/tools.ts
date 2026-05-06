@@ -1,4 +1,3 @@
-import * as crypto from 'crypto';
 import { z } from 'zod/v3';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
@@ -7,50 +6,77 @@ import {
   domainQuery,
 } from '../query/retriever';
 import {
-  getStats, getFullOverview, getCachedAskResponse, insertCachedAskResponse, insertQaRun,
+  getStats, getFullOverview,
+  getCachedAskResponse, insertCachedAskResponse, insertQaRun,
+  getFunctionsByName,
 } from '../db/queries';
-import { classifyQuestion } from '../query/classifier';
+import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
 import { generateAnswer } from '../query/answerer';
+import { getGraphFingerprint, makeAskCacheKey } from '../query/ask-cache';
 import { loadConfig, getStructXDir, getLlmConfig } from '../config';
 import { getDb, resolveRepoPath, StructxNotInitializedError } from './db-pool';
 import { formatContext, formatFunction, formatType, formatRoute, formatFile } from './format';
 
 // All tool args may include a repo_path that overrides the server's default.
 const RepoPath = z.string().optional().describe('Absolute path to the repo. Defaults to the server\'s --repo arg or cwd.');
+const Detail = z.enum(['summary', 'full']).optional().describe('summary returns compact structuredContent (default); full returns all retrieved fields.');
+const Limit = z.number().int().min(1).max(100).optional().describe('Maximum rows per entity kind in this response.');
 const SearchArgs = z.object({
   keywords: z.array(z.string()).min(1).describe('Search terms (e.g. ["auth", "login"]). FTS-sanitized internally.'),
   mode: z.enum(['narrow', 'broad']).optional().describe('narrow = fewer high-precision results (default); broad = wider net for cross-cutting concerns.'),
+  limit: Limit,
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
 const FunctionArgs = z.object({
   name: z.string().describe('Exact function name.'),
+  include_body: z.boolean().optional().describe('Include the full function body in text and structuredContent. Defaults to false.'),
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
 const RelationshipArgs = z.object({
   name: z.string().describe('Exact function name.'),
   direction: z.enum(['callers', 'callees']).describe('callers = who invokes this function; callees = what this function invokes.'),
+  limit: Limit,
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
-const ImpactArgs = FunctionArgs;
+const ImpactArgs = z.object({
+  name: z.string().describe('Exact function name.'),
+  limit: Limit,
+  detail: Detail,
+  repo_path: RepoPath,
+}).strict();
 const RouteArgs = z.object({
   path: z.string().optional().describe('Path or substring (e.g. "/users", "/api"). Matches anywhere in the route path.'),
   method: z.string().optional().describe('HTTP method filter (GET, POST, etc.). Case-insensitive.'),
+  limit: Limit,
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
 const TypeArgs = z.object({
   name: z.string().describe('Type/interface/enum name.'),
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
 const FileArgs = z.object({
   path: z.string().optional().describe('File path relative to repo (e.g. "src/auth.ts"). Empty = all files summary.'),
+  limit: Limit,
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
 const ListArgs = z.object({
   entity: z.enum(['routes', 'types', 'files', 'functions', 'constants']).optional().describe('Kind to enumerate. Omit for a mixed cross-section.'),
+  limit: Limit,
+  detail: Detail,
   repo_path: RepoPath,
 }).strict();
-const OverviewArgs = z.object({ repo_path: RepoPath }).strict();
+const OverviewArgs = z.object({
+  max_items: z.number().int().min(1).max(100).optional().describe('Maximum rows per overview section. Defaults to 10.'),
+  detail: Detail,
+  repo_path: RepoPath,
+}).strict();
 const AskArgs = z.object({
   question: z.string().describe('Natural language question (e.g. "How is authentication handled?").'),
   repo_path: RepoPath,
@@ -113,17 +139,144 @@ async function withDbAsync<T>(
   }
 }
 
+function limitContext(ctx: any, limit?: number): any {
+  if (!limit) return ctx;
+  return {
+    ...ctx,
+    functions: ctx.functions.slice(0, limit),
+    types: ctx.types.slice(0, limit),
+    routes: ctx.routes.slice(0, limit),
+    files: ctx.files.slice(0, limit),
+    constants: ctx.constants.slice(0, limit),
+  };
+}
+
+function structuredContext(ctx: any, detail?: 'summary' | 'full'): any {
+  if (detail === 'full') return ctx;
+  return {
+    strategy: ctx.strategy,
+    functions: ctx.functions.map((fn: any) => ({
+      name: fn.name,
+      location: fn.location,
+      signature: fn.signature,
+      purpose: fn.purpose,
+      behavior: fn.behavior,
+      sideEffects: fn.sideEffects,
+      domain: fn.domain,
+      complexity: fn.complexity,
+      calls: fn.calls,
+      calledBy: fn.calledBy,
+      ...(fn.body ? { body: fn.body } : {}),
+    })),
+    types: ctx.types.map((t: any) => ({
+      name: t.name,
+      kind: t.kind,
+      location: t.location,
+      isExported: t.isExported,
+      purpose: t.purpose,
+    })),
+    routes: ctx.routes.map((r: any) => ({
+      method: r.method,
+      path: r.path,
+      location: r.location,
+      handlerName: r.handlerName,
+      middleware: r.middleware,
+      purpose: r.purpose,
+    })),
+    files: ctx.files,
+    constants: ctx.constants,
+  };
+}
+
+function addFunctionBody(db: ReturnType<typeof getDb>, ctx: any, name: string, includeBody?: boolean): any {
+  if (!includeBody || ctx.functions.length === 0) return ctx;
+  const rows = getFunctionsByName(db, name);
+  if (rows.length === 0) return ctx;
+  return {
+    ...ctx,
+    functions: ctx.functions.map((fn: any, i: number) => rows[i] ? { ...fn, body: rows[i].body } : fn),
+  };
+}
+
+function formatFunctionResult(fn: any, includeBody?: boolean): string {
+  const text = formatFunction(fn);
+  if (!includeBody || !fn.body) return text;
+  return `${text}\n\nBody:\n\`\`\`ts\n${fn.body}\n\`\`\``;
+}
+
+function compactOverview(overview: ReturnType<typeof getFullOverview>, maxItems: number) {
+  return {
+    stats: overview.stats,
+    files: overview.files.slice(0, maxItems).map(f => ({
+      path: f.path,
+      summary: f.summary ? {
+        import_count: f.summary.import_count,
+        export_count: f.summary.export_count,
+        function_count: f.summary.function_count,
+        type_count: f.summary.type_count,
+        route_count: f.summary.route_count,
+        loc: f.summary.loc,
+        purpose: f.summary.purpose,
+      } : null,
+    })),
+    functions: overview.functions.slice(0, maxItems).map(fn => ({
+      name: fn.name,
+      filePath: fn.filePath,
+      start_line: fn.start_line,
+      end_line: fn.end_line,
+      signature: fn.signature,
+      is_exported: fn.is_exported,
+      is_async: fn.is_async,
+      purpose: fn.purpose,
+      domain: fn.domain,
+    })),
+    types: overview.types.slice(0, maxItems).map(t => ({
+      name: t.name,
+      kind: t.kind,
+      filePath: t.filePath,
+      start_line: t.start_line,
+      end_line: t.end_line,
+      is_exported: t.is_exported,
+      purpose: t.purpose,
+    })),
+    routes: overview.routes.slice(0, maxItems).map(r => ({
+      method: r.method,
+      path: r.path,
+      filePath: r.filePath,
+      start_line: r.start_line,
+      end_line: r.end_line,
+      handler_name: r.handler_name,
+      purpose: r.purpose,
+    })),
+    constants: overview.constants.slice(0, maxItems).map(c => ({
+      name: c.name,
+      filePath: c.filePath,
+      start_line: c.start_line,
+      end_line: c.end_line,
+      type_annotation: c.type_annotation,
+      is_exported: c.is_exported,
+    })),
+    truncated: {
+      files: overview.files.length > maxItems,
+      functions: overview.functions.length > maxItems,
+      types: overview.types.length > maxItems,
+      routes: overview.routes.length > maxItems,
+      constants: overview.constants.length > maxItems,
+    },
+  };
+}
+
 export function registerTools(server: McpServer, defaultRepo: string): void {
   // ── 1. structx_search ──────────────────────────────────────────────────
   server.registerTool('structx_search', {
     description: 'Search the code graph by keywords. Returns matching functions, types, routes, and constants. Pure graph query — no LLM cost.',
     inputSchema: SearchArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = args.mode === 'broad'
+    const ctx = limitContext(args.mode === 'broad'
       ? patternQuery(db, args.keywords)
-      : semanticSearch(db, args.keywords);
+      : semanticSearch(db, args.keywords), args.limit);
     const text = formatContext(ctx, `Search results for: ${args.keywords.join(', ')}`);
-    return { content: [{ type: 'text' as const, text }], structuredContent: ctx };
+    return { content: [{ type: 'text' as const, text }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 2. structx_function ────────────────────────────────────────────────
@@ -131,12 +284,12 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Get full details for a function by exact name: signature, location, purpose, side effects, callers, callees.',
     inputSchema: FunctionArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = directLookup(db, args.name);
+    const ctx = addFunctionBody(db, directLookup(db, args.name), args.name, args.include_body);
     if (ctx.functions.length === 0) {
-      return { content: [{ type: 'text' as const, text: `No function named '${args.name}' found.` }], structuredContent: ctx };
+      return { content: [{ type: 'text' as const, text: `No function named '${args.name}' found.` }], structuredContent: structuredContext(ctx, args.detail) };
     }
-    const text = formatFunction(ctx.functions[0]);
-    return { content: [{ type: 'text' as const, text }], structuredContent: ctx };
+    const text = ctx.functions.map((fn: any) => formatFunctionResult(fn, args.include_body)).join('\n\n');
+    return { content: [{ type: 'text' as const, text }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 3. structx_relationships ──────────────────────────────────────────
@@ -144,9 +297,9 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Find what calls a function (callers) or what a function calls (callees). Direct relationships only — use structx_impact for transitive.',
     inputSchema: RelationshipArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = relationshipQuery(db, args.name, args.direction);
+    const ctx = limitContext(relationshipQuery(db, args.name, args.direction), args.limit);
     const header = args.direction === 'callers' ? `Callers of ${args.name}` : `Callees of ${args.name}`;
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, header) }], structuredContent: ctx };
+    return { content: [{ type: 'text' as const, text: formatContext(ctx, header) }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 4. structx_impact ──────────────────────────────────────────────────
@@ -154,8 +307,8 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Compute the transitive impact of changing a function: every direct and indirect caller via recursive traversal.',
     inputSchema: ImpactArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = impactAnalysis(db, args.name);
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, `Impact of changing ${args.name}`) }], structuredContent: ctx };
+    const ctx = limitContext(impactAnalysis(db, args.name), args.limit);
+    return { content: [{ type: 'text' as const, text: formatContext(ctx, `Impact of changing ${args.name}`) }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 5. structx_route ───────────────────────────────────────────────────
@@ -163,8 +316,8 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Find HTTP routes by path pattern and/or method. Both args optional — empty call returns all routes.',
     inputSchema: RouteArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = routeQuery(db, args.path ?? null, args.method ?? null);
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, 'Routes') }], structuredContent: ctx };
+    const ctx = limitContext(routeQuery(db, args.path ?? null, args.method ?? null), args.limit);
+    return { content: [{ type: 'text' as const, text: formatContext(ctx, 'Routes') }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 6. structx_type ────────────────────────────────────────────────────
@@ -174,10 +327,10 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = typeQuery(db, args.name);
     if (ctx.types.length === 0) {
-      return { content: [{ type: 'text' as const, text: `No type named '${args.name}' found.` }], structuredContent: ctx };
+      return { content: [{ type: 'text' as const, text: `No type named '${args.name}' found.` }], structuredContent: structuredContext(ctx, args.detail) };
     }
     const text = ctx.types.map(formatType).join('\n\n');
-    return { content: [{ type: 'text' as const, text }], structuredContent: ctx };
+    return { content: [{ type: 'text' as const, text }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 7. structx_file ────────────────────────────────────────────────────
@@ -185,11 +338,11 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Get a file overview (functions, types, routes, constants). Empty path returns summaries for all files.',
     inputSchema: FileArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = fileQuery(db, args.path ?? null);
+    const ctx = limitContext(fileQuery(db, args.path ?? null), args.limit);
     if (args.path && ctx.functions.length === 0 && ctx.types.length === 0 && ctx.routes.length === 0 && ctx.files.length === 0) {
-      return { content: [{ type: 'text' as const, text: `File '${args.path}' not found in graph.` }], structuredContent: ctx, isError: true };
+      return { content: [{ type: 'text' as const, text: `File '${args.path}' not found in graph.` }], structuredContent: structuredContext(ctx, args.detail), isError: true };
     }
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, args.path ? `File: ${args.path}` : 'All files') }], structuredContent: ctx };
+    return { content: [{ type: 'text' as const, text: formatContext(ctx, args.path ? `File: ${args.path}` : 'All files') }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 8. structx_list ────────────────────────────────────────────────────
@@ -197,8 +350,8 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Enumerate one kind of entity. Useful for "what routes exist", "what types are defined", etc.',
     inputSchema: ListArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = listQuery(db, args.entity ?? null);
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, args.entity ? `All ${args.entity}` : 'Repo overview') }], structuredContent: ctx };
+    const ctx = limitContext(listQuery(db, args.entity ?? null, args.limit ?? 50), args.limit);
+    return { content: [{ type: 'text' as const, text: formatContext(ctx, args.entity ? `All ${args.entity}` : 'Repo overview') }], structuredContent: structuredContext(ctx, args.detail) };
   }));
 
   // ── 9. structx_overview ────────────────────────────────────────────────
@@ -208,8 +361,8 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db, repo) => {
     const stats = getStats(db);
     const overview = getFullOverview(db);
-    const maxItems = 20;
-    const truncated = {
+    const maxItems = args.max_items ?? 10;
+    const fullStructured = {
       stats,
       files: overview.files.slice(0, maxItems),
       functions: overview.functions.slice(0, maxItems),
@@ -224,6 +377,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
         constants: overview.constants.length > maxItems,
       },
     };
+    const structured = args.detail === 'full' ? fullStructured : compactOverview(overview, maxItems);
     const lines = [
       `# Repo: ${repo}`,
       '',
@@ -237,15 +391,15 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
       `- **QA runs logged:** ${stats.totalQaRuns}`,
     ];
 
-    const fileLines = truncated.files.map(f => {
+    const fileLines = fullStructured.files.map(f => {
       const summary = f.summary ? ` (${f.summary.function_count} fns, ${f.summary.type_count} types, ${f.summary.route_count} routes, ${f.summary.loc} LOC)` : '';
       const purpose = f.summary?.purpose ? ` - ${f.summary.purpose}` : '';
       return `- ${f.path}${summary}${purpose}`;
     });
-    const functionLines = truncated.functions.map(fn => `- ${fn.name} (${fn.filePath}:${fn.start_line})${fn.purpose ? ` - ${fn.purpose}` : ''}`);
-    const typeLines = truncated.types.map(t => `- ${t.kind} ${t.name} (${t.filePath}:${t.start_line})${t.purpose ? ` - ${t.purpose}` : ''}`);
-    const routeLines = truncated.routes.map(r => `- ${r.method.toUpperCase()} ${r.path} (${r.filePath}:${r.start_line})${r.purpose ? ` - ${r.purpose}` : ''}`);
-    const constantLines = truncated.constants.map(c => `- ${c.name} (${c.filePath}:${c.start_line})`);
+    const functionLines = fullStructured.functions.map(fn => `- ${fn.name} (${fn.filePath}:${fn.start_line})${fn.purpose ? ` - ${fn.purpose}` : ''}`);
+    const typeLines = fullStructured.types.map(t => `- ${t.kind} ${t.name} (${t.filePath}:${t.start_line})${t.purpose ? ` - ${t.purpose}` : ''}`);
+    const routeLines = fullStructured.routes.map(r => `- ${r.method.toUpperCase()} ${r.path} (${r.filePath}:${r.start_line})${r.purpose ? ` - ${r.purpose}` : ''}`);
+    const constantLines = fullStructured.constants.map(c => `- ${c.name} (${c.filePath}:${c.start_line})`);
 
     if (fileLines.length > 0) lines.push('', '## Files', ...fileLines);
     if (routeLines.length > 0) lines.push('', '## Routes', ...routeLines);
@@ -256,7 +410,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
       lines.push('', `_Showing first ${maxItems} rows per section._`);
     }
 
-    return { content: [{ type: 'text' as const, text: lines.join('\n') }], structuredContent: truncated };
+    return { content: [{ type: 'text' as const, text: lines.join('\n') }], structuredContent: structured };
   }));
 
   // ── 10. structx_ask ────────────────────────────────────────────────────
@@ -267,14 +421,21 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     const config = loadConfig(getStructXDir(repo));
 
     // Cache check — same key the CLI uses.
-    const questionHash = crypto.createHash('sha256')
-      .update(`${args.question.toLowerCase().trim()}|${config.answerModel}`)
-      .digest('hex');
+    const graphHash = getGraphFingerprint(db);
+    const questionHash = makeAskCacheKey(args.question, config.answerModel, graphHash);
     const cached = getCachedAskResponse(db, questionHash);
     if (cached) {
       return {
         content: [{ type: 'text' as const, text: cached.answer_text + `\n\n_(cached, strategy: ${cached.strategy})_` }],
-        structuredContent: { answer: cached.answer_text, strategy: cached.strategy, cached: true, cost: 0 },
+        structuredContent: {
+          answer: cached.answer_text,
+          strategy: cached.strategy,
+          cached: true,
+          inputTokens: cached.input_tokens ?? 0,
+          outputTokens: cached.output_tokens ?? 0,
+          cost: 0,
+          graphHash,
+        },
       };
     }
 
@@ -290,7 +451,8 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     }
 
     // Classify
-    const classification = await classifyQuestion(args.question, config.classifierModel, getLlmConfig(config));
+    const classificationResult = await classifyQuestionWithUsage(args.question, config.classifierModel, getLlmConfig(config));
+    const classification = classificationResult.classification;
 
     // Retrieve via the same dispatch as CLI
     const graphQueryStart = Date.now();
@@ -313,18 +475,22 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     const context = buildContext(retrieved, args.question);
     const answerResult = await generateAnswer(args.question, context, config.answerModel, getLlmConfig(config));
 
+    const totalInputTokens = classificationResult.inputTokens + answerResult.inputTokens;
+    const totalOutputTokens = classificationResult.outputTokens + answerResult.outputTokens;
+    const totalCost = classificationResult.cost + answerResult.cost;
+
     // Cache + log run, same as CLI.
     insertCachedAskResponse(
       db, questionHash, classification.strategy, answerResult.answer,
-      config.answerModel, answerResult.inputTokens, answerResult.outputTokens, answerResult.cost,
+      config.answerModel, totalInputTokens, totalOutputTokens, totalCost,
     );
     insertQaRun(db, {
       mode: 'structx-mcp',
       question: args.question,
-      input_tokens: answerResult.inputTokens,
-      output_tokens: answerResult.outputTokens,
-      total_tokens: answerResult.inputTokens + answerResult.outputTokens,
-      cost_usd: answerResult.cost,
+      input_tokens: totalInputTokens,
+      output_tokens: totalOutputTokens,
+      total_tokens: totalInputTokens + totalOutputTokens,
+      cost_usd: totalCost,
       response_time_ms: answerResult.responseTimeMs,
       files_accessed: null,
       functions_retrieved: retrieved.functions.length,
@@ -338,10 +504,17 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
         answer: answerResult.answer,
         strategy: classification.strategy,
         cached: false,
-        inputTokens: answerResult.inputTokens,
-        outputTokens: answerResult.outputTokens,
-        cost: answerResult.cost,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        classifierInputTokens: classificationResult.inputTokens,
+        classifierOutputTokens: classificationResult.outputTokens,
+        answerInputTokens: answerResult.inputTokens,
+        answerOutputTokens: answerResult.outputTokens,
+        cost: totalCost,
+        classifierCost: classificationResult.cost,
+        answerCost: answerResult.cost,
         graphQueryTimeMs,
+        graphHash,
       },
     };
   }));

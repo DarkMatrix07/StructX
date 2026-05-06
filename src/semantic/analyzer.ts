@@ -17,6 +17,16 @@ import {
 import { validateSemanticResponse, type SemanticResult } from './validator';
 import { estimateCost } from '../utils/tokens';
 import { logger } from '../utils/logger';
+import { normalizeRepoPath } from '../utils/paths';
+
+type LlmSource = LlmClientConfig | LlmClient;
+
+function resolveLlmClient(source: LlmSource): LlmClient {
+  if (typeof (source as LlmClient).complete === 'function') {
+    return source as LlmClient;
+  }
+  return createLlmClient(source as LlmClientConfig);
+}
 
 export interface AnalyzeResult {
   analyzed: number;
@@ -31,9 +41,9 @@ export async function analyzeBatch(
   db: Database.Database,
   queueItems: Array<{ id: number; function_id: number }>,
   model: string,
-  llmConfig: LlmClientConfig,
+  llmConfig: LlmSource,
 ): Promise<AnalyzeResult> {
-  const client: LlmClient = createLlmClient(llmConfig);
+  const client = resolveLlmClient(llmConfig);
   const result: AnalyzeResult = { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   // Build prompt functions from queue items
@@ -222,9 +232,9 @@ export interface SimpleAnalyzeResult {
 export async function analyzeTypes(
   db: Database.Database,
   model: string,
-  llmConfig: LlmClientConfig,
+  llmConfig: LlmSource,
 ): Promise<SimpleAnalyzeResult> {
-  const client = createLlmClient(llmConfig);
+  const client = resolveLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const types = getAllTypes(db).filter(t => !t.semantic_analyzed_at);
@@ -252,10 +262,12 @@ export async function analyzeTypes(
       result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
-      const parsed = JSON.parse(cleaned) as Array<{ name: string; purpose: string }>;
+      const parsed = JSON.parse(cleaned) as Array<{ id?: number; name: string; purpose: string }>;
 
       for (const item of parsed) {
-        const typeRow = batch.find(t => t.name === item.name);
+        const typeRow = typeof item.id === 'number'
+          ? batch.find(t => t.id === item.id)
+          : batch.find(t => t.name === item.name);
         if (typeRow) {
           updateTypePurpose(db, typeRow.id, item.purpose);
           result.analyzed++;
@@ -273,9 +285,9 @@ export async function analyzeTypes(
 export async function analyzeRoutes(
   db: Database.Database,
   model: string,
-  llmConfig: LlmClientConfig,
+  llmConfig: LlmSource,
 ): Promise<SimpleAnalyzeResult> {
-  const client = createLlmClient(llmConfig);
+  const client = resolveLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const routes = getAllRoutes(db).filter(r => !r.semantic_analyzed_at);
@@ -322,9 +334,9 @@ export async function analyzeRoutes(
 export async function analyzeFileSummaries(
   db: Database.Database,
   model: string,
-  llmConfig: LlmClientConfig,
+  llmConfig: LlmSource,
 ): Promise<SimpleAnalyzeResult> {
-  const client = createLlmClient(llmConfig);
+  const client = resolveLlmClient(llmConfig);
   const result: SimpleAnalyzeResult = { analyzed: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
 
   const summaries = getAllFileSummaries(db).filter(s => !s.semantic_analyzed_at);
@@ -361,10 +373,13 @@ export async function analyzeFileSummaries(
       result.totalCost += estimateCost(model, inputTokens, outputTokens);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
-      const parsed = JSON.parse(cleaned) as Array<{ path: string; purpose: string }>;
+      const parsed = JSON.parse(cleaned) as Array<{ id?: number; path: string; purpose: string }>;
 
       for (const item of parsed) {
-        const summaryRow = batch.find(s => fileMap.get(s.file_id) === item.path);
+        const normalizedPath = normalizeRepoPath(item.path);
+        const summaryRow = typeof item.id === 'number'
+          ? batch.find(s => s.id === item.id)
+          : batch.find(s => normalizeRepoPath(fileMap.get(s.file_id) || '') === normalizedPath);
         if (summaryRow) {
           updateFileSummaryPurpose(db, summaryRow.id, item.purpose);
           result.analyzed++;

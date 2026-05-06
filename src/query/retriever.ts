@@ -1,10 +1,10 @@
 import type Database from 'better-sqlite3';
 import type { FunctionRow, TypeRow, RouteRow, ConstantRow, FileSummaryRow } from '../db/queries';
 import {
-  getFunctionByName, getFunctionById, getCallees, getCallers, getCallersByName,
+  getFunctionByName, getFunctionsByName, getFunctionById, getCallees, getCallers, getCallersByName,
   searchFunctions, getTransitiveCallersRobust,
   getAllRoutes, searchRoutes, getRoutesByFileId,
-  getTypeByName, searchTypes, getAllTypes,
+  getTypesByName, searchTypes, getAllTypes,
   getAllFunctions, getAllFiles, getAllFileSummaries,
   getConstantsByFileId, getFileOverview,
   searchFiles, searchConstants, getFileSummary, getFileByPath,
@@ -112,13 +112,14 @@ function emptyContext(strategy: string): RetrievedContext {
 }
 
 export function directLookup(db: Database.Database, name: string): RetrievedContext {
-  const fn = getFunctionByName(db, name);
-  if (!fn) {
+  const fns = getFunctionsByName(db, name);
+  if (fns.length === 0) {
     return emptyContext('direct');
   }
+  const cache = buildEnrichCache(db, fns);
   return {
     ...emptyContext('direct'),
-    functions: [enrichFunction(db, fn)],
+    functions: fns.map(fn => enrichFunction(db, fn, cache)),
   };
 }
 
@@ -127,8 +128,8 @@ export function relationshipQuery(
   name: string,
   direction: 'callers' | 'callees'
 ): RetrievedContext {
-  const fn = getFunctionByName(db, name);
-  if (!fn) {
+  const matches = getFunctionsByName(db, name);
+  if (matches.length === 0) {
     return emptyContext('relationship');
   }
 
@@ -136,8 +137,8 @@ export function relationshipQuery(
   const unresolved: RetrievedFunction[] = [];
 
   if (direction === 'callees') {
-    const callees = getCallees(db, fn.id);
-    const calleeIds = callees.filter(r => r.callee_function_id).map(r => r.callee_function_id!) as number[];
+    const callees = matches.flatMap(fn => getCallees(db, fn.id));
+    const calleeIds = [...new Set(callees.filter(r => r.callee_function_id).map(r => r.callee_function_id!))] as number[];
     const calleeNames = getFunctionNamesByIds(db, calleeIds);
     // Fetch full rows in one go for ids we can resolve
     if (calleeIds.length > 0) {
@@ -148,8 +149,11 @@ export function relationshipQuery(
       collected.push(...rows);
     }
     void calleeNames;
+    const seenUnresolved = new Set<string>();
     for (const rel of callees) {
       if (!rel.callee_function_id) {
+        if (seenUnresolved.has(rel.callee_name)) continue;
+        seenUnresolved.add(rel.callee_name);
         unresolved.push({
           name: rel.callee_name,
           location: 'unresolved',
@@ -165,7 +169,7 @@ export function relationshipQuery(
       }
     }
   } else {
-    const callers = getCallers(db, fn.id);
+    const callers = matches.flatMap(fn => getCallers(db, fn.id));
     const callersByName = getCallersByName(db, name);
     const seenIds = new Set<number>();
     const callerIds: number[] = [];
@@ -218,13 +222,13 @@ export function domainQuery(db: Database.Database, domain: string): RetrievedCon
 }
 
 export function impactAnalysis(db: Database.Database, name: string): RetrievedContext {
-  const fn = getFunctionByName(db, name);
-  if (!fn) {
+  const matches = getFunctionsByName(db, name);
+  if (matches.length === 0) {
     return emptyContext('impact');
   }
 
   // Direct callers
-  const directCallers = getCallers(db, fn.id);
+  const directCallers = matches.flatMap(fn => getCallers(db, fn.id));
   const directCallersByName = getCallersByName(db, name);
   const allDirectCallerIds = new Set([
     ...directCallers.map(r => r.caller_function_id),
@@ -232,7 +236,7 @@ export function impactAnalysis(db: Database.Database, name: string): RetrievedCo
   ]);
 
   // Transitive callers (using both ID and name for robustness)
-  const transitiveCallers = getTransitiveCallersRobust(db, fn.id, name);
+  const transitiveCallers = matches.flatMap(fn => getTransitiveCallersRobust(db, fn.id, name));
 
   const seenIds = new Set<number>();
   const ordered: FunctionRow[] = [];
@@ -290,22 +294,71 @@ export function routeQuery(db: Database.Database, routePath?: string | null, met
 }
 
 export function typeQuery(db: Database.Database, typeName: string): RetrievedContext {
-  const t = getTypeByName(db, typeName);
-  if (!t) {
+  const exactTypes = getTypesByName(db, typeName);
+  if (exactTypes.length === 0) {
     // Try FTS search — sanitize so unusual characters in the type name don't crash MATCH.
     const query = sanitizeFtsQuery(typeName);
-    if (!query) return emptyContext('type');
-    const results = searchTypes(db, query, 5);
-    const cache = buildEnrichCache(db, [], results);
+    const results = query ? searchTypes(db, query, 5) : [];
+    const fallback = results.length > 0 ? results : fuzzyTypeSearch(db, typeName, 5);
+    const cache = buildEnrichCache(db, [], fallback);
     return {
       ...emptyContext('type'),
-      types: results.map(r => enrichType(db, r, cache)),
+      types: fallback.map(r => enrichType(db, r, cache)),
     };
   }
+  const cache = buildEnrichCache(db, [], exactTypes);
   return {
     ...emptyContext('type'),
-    types: [enrichType(db, t)],
+    types: exactTypes.map(t => enrichType(db, t, cache)),
   };
+}
+
+function fuzzyTypeSearch(db: Database.Database, query: string, limit: number): TypeRow[] {
+  const terms = expandSearchTerms(query);
+  if (terms.length === 0) return [];
+
+  const scored = getAllTypes(db)
+    .map(type => {
+      const haystack = [
+        type.name,
+        splitIdentifier(type.name).join(' '),
+        type.kind,
+        type.full_text,
+        type.purpose ?? '',
+      ].join(' ').toLowerCase();
+      const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
+      return { type, score };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.type.name.localeCompare(b.type.name));
+
+  return scored.slice(0, limit).map(item => item.type);
+}
+
+function expandSearchTerms(query: string): string[] {
+  const synonyms: Record<string, string[]> = {
+    parameter: ['option', 'options', 'config', 'configuration'],
+    parameters: ['option', 'options', 'config', 'configuration'],
+    option: ['parameter', 'parameters', 'config', 'configuration'],
+    options: ['parameter', 'parameters', 'config', 'configuration'],
+  };
+  const terms = new Set<string>();
+  for (const raw of query.split(/\s+/)) {
+    const term = raw.replace(/[^A-Za-z0-9_$]/g, '').toLowerCase();
+    if (term.length < 2) continue;
+    terms.add(term);
+    for (const synonym of synonyms[term] ?? []) terms.add(synonym);
+  }
+  return [...terms];
+}
+
+function splitIdentifier(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_$-]+/g, ' ')
+    .split(/\s+/)
+    .map(part => part.toLowerCase())
+    .filter(Boolean);
 }
 
 export function fileQuery(db: Database.Database, filePath?: string | null): RetrievedContext {
@@ -344,31 +397,31 @@ export function fileQuery(db: Database.Database, filePath?: string | null): Retr
   };
 }
 
-export function listQuery(db: Database.Database, entity: string | null): RetrievedContext {
+export function listQuery(db: Database.Database, entity: string | null, maxRows: number = 50): RetrievedContext {
   const ctx = emptyContext('list');
 
   switch (entity) {
     case 'routes': {
-      const routes = getAllRoutes(db);
+      const routes = getAllRoutes(db).slice(0, maxRows);
       const cache = buildEnrichCache(db, [], [], routes);
       ctx.routes = routes.map(r => enrichRoute(db, r, cache));
       break;
     }
     case 'types': {
-      const types = getAllTypes(db);
+      const types = getAllTypes(db).slice(0, maxRows);
       const cache = buildEnrichCache(db, [], types);
       ctx.types = types.map(t => enrichType(db, t, cache));
       break;
     }
     case 'files': {
-      const summaries = getAllFileSummaries(db);
+      const summaries = getAllFileSummaries(db).slice(0, maxRows);
       const fileRows = getAllFiles(db);
       const fileMap = new Map(fileRows.map(f => [f.id, f.path]));
       ctx.files = summaries.map(s => enrichFileSummary(fileMap.get(s.file_id) || 'unknown', s));
       break;
     }
     case 'functions': {
-      const fns = getAllFunctions(db).slice(0, 50);
+      const fns = getAllFunctions(db).slice(0, maxRows);
       const cache = buildEnrichCache(db, fns);
       ctx.functions = fns.map(fn => enrichFunction(db, fn, cache));
       break;
@@ -379,8 +432,9 @@ export function listQuery(db: Database.Database, entity: string | null): Retriev
       for (const file of allFileRows) {
         allConsts.push(...getConstantsByFileId(db, file.id));
       }
-      const cache = buildEnrichCache(db, [], [], [], allConsts);
-      ctx.constants = allConsts.map(c => enrichConstant(db, c, cache));
+      const limitedConsts = allConsts.slice(0, maxRows);
+      const cache = buildEnrichCache(db, [], [], [], limitedConsts);
+      ctx.constants = limitedConsts.map(c => enrichConstant(db, c, cache));
       break;
     }
     default: {
@@ -408,7 +462,11 @@ export function patternQuery(db: Database.Database, keywords: string[]): Retriev
   const types = searchTypes(db, query, 10);
   const routes = searchRoutes(db, query, 10);
   const constants = searchConstants(db, keywords, 5);
-  const fileSummaries = searchFiles(db, query, 5);
+  const fileSummaries = mergeFileSummaryResults(
+    searchFiles(db, query, 5),
+    searchFileSummariesByPath(db, keywords, 10),
+    10,
+  );
 
   const allFileRows = getAllFiles(db);
   const fileMap = new Map(allFileRows.map(f => [f.id, f.path]));
@@ -422,6 +480,46 @@ export function patternQuery(db: Database.Database, keywords: string[]): Retriev
     constants: constants.map(c => enrichConstant(db, c, cache)),
     files: fileSummaries.map(s => enrichFileSummary(fileMap.get(s.file_id) || 'unknown', s)),
   };
+}
+
+function searchFileSummariesByPath(
+  db: Database.Database,
+  keywords: string[],
+  limit: number,
+): FileSummaryRow[] {
+  const terms = keywords
+    .flatMap(k => String(k).split(/\s+/))
+    .map(k => k.replace(/["*:()\-^]/g, '').trim().toLowerCase())
+    .filter(k => k.length > 1 && k !== 'and' && k !== 'or' && k !== 'not' && k !== 'near');
+  if (terms.length === 0) return [];
+
+  const files = getAllFiles(db);
+  const matches = files
+    .filter(f => terms.some(term => f.path.toLowerCase().includes(term)))
+    .slice(0, limit);
+
+  const summaries: FileSummaryRow[] = [];
+  for (const file of matches) {
+    const summary = getFileSummary(db, file.id);
+    if (summary) summaries.push(summary);
+  }
+  return summaries;
+}
+
+function mergeFileSummaryResults(
+  primary: FileSummaryRow[],
+  fallback: FileSummaryRow[],
+  limit: number,
+): FileSummaryRow[] {
+  const seen = new Set<number>();
+  const merged: FileSummaryRow[] = [];
+  for (const row of [...primary, ...fallback]) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    merged.push(row);
+    if (merged.length >= limit) break;
+  }
+  return merged;
 }
 
 function resolveFilePath(db: Database.Database, fileId: number, cache?: EnrichCache): string | null {

@@ -4,18 +4,18 @@ import 'dotenv/config';
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import * as crypto from 'crypto';
 import { getStructXDir, loadConfig, saveConfig, ensureStructxGitignored, getLlmConfig } from './config';
 import { initializeDatabase, openDatabase, getDbPath } from './db/connection';
 import { getStats, getFullOverview } from './db/queries';
 import { logger, setLogLevel } from './utils/logger';
 import { analyzeBatch, rebuildSearchIndex, analyzeTypes, analyzeRoutes, analyzeFileSummaries } from './semantic/analyzer';
 import { estimateAnalysisCost, formatCostEstimate } from './semantic/cost';
-import { getPendingAnalysis, getPendingAnalysisCount, insertQaRun, getCachedAskResponse, insertCachedAskResponse } from './db/queries';
-import { classifyQuestion } from './query/classifier';
+import { getPendingAnalysis, getPendingAnalysisCount, enqueueUnanalyzedFunctions, insertQaRun, getCachedAskResponse, insertCachedAskResponse } from './db/queries';
+import { classifyQuestionWithUsage } from './query/classifier';
 import { directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
 import { buildContext } from './query/context-builder';
 import { generateAnswer } from './query/answerer';
+import { getGraphFingerprint, makeAskCacheKey } from './query/ask-cache';
 import { runBenchmark } from './benchmark/runner';
 import { generateMarkdownReport, generateCsvReport, saveReport } from './benchmark/reporter';
 import { ingestDirectory, printIngestResult } from './ingest/ingester';
@@ -27,7 +27,7 @@ const program = new Command();
 program
   .name('structx')
   .description('Graph-powered code intelligence CLI for TypeScript')
-  .version('2.2.1')
+  .version('3.0.2')
   .option('--verbose', 'Enable verbose logging')
   .hook('preAction', (thisCommand) => {
     if (thisCommand.opts().verbose) {
@@ -412,9 +412,10 @@ program
 
       // Check API key
       if (config.anthropicApiKey) {
-        console.log('  [OK] Anthropic API key is set');
+        console.log(`  [OK] API key is set for ${config.provider}`);
       } else {
-        console.log('  [WARN] Anthropic API key not set (set ANTHROPIC_API_KEY env var or add to config)');
+        const envVar = config.provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'ANTHROPIC_API_KEY';
+        console.log(`  [WARN] API key not set for ${config.provider} (set ${envVar} env var or add to config)`);
         allGood = false;
       }
 
@@ -551,10 +552,17 @@ program
     }
 
     const db = openDatabase(dbPath);
-    const pendingCount = getPendingAnalysisCount(db);
+    let pendingCount = getPendingAnalysisCount(db);
+    if (pendingCount === 0) {
+      const enqueued = enqueueUnanalyzedFunctions(db);
+      if (enqueued > 0) {
+        console.log(`Queued ${enqueued} unanalyzed function(s).`);
+        pendingCount = getPendingAnalysisCount(db);
+      }
+    }
 
     if (pendingCount === 0) {
-      console.log('No functions pending analysis. Run "structx ingest" first.');
+      console.log('No functions pending analysis. Run "structx ingest" first if files were recently added.');
       db.close();
       return;
     }
@@ -734,12 +742,10 @@ program
 
     const startTime = Date.now();
 
-    // Cache check — keyed by SHA256(question.normalized + answerModel) so
-    // identical questions with the same model return instantly.
-    const questionHash = crypto
-      .createHash('sha256')
-      .update(`${question.toLowerCase().trim()}|${config.answerModel}`)
-      .digest('hex');
+    // Cache check: include the graph fingerprint so changed code or updated
+    // semantic metadata cannot return a stale answer for the same question.
+    const graphHash = getGraphFingerprint(db);
+    const questionHash = makeAskCacheKey(question, config.answerModel, graphHash);
     const cached = getCachedAskResponse(db, questionHash);
     if (cached) {
       const entityCount = 0;
@@ -754,7 +760,8 @@ program
 
     // Step 1: Classify the question
     console.log('Classifying question...');
-    const classification = await classifyQuestion(question, config.classifierModel, getLlmConfig(config));
+    const classificationResult = await classifyQuestionWithUsage(question, config.classifierModel, getLlmConfig(config));
+    const classification = classificationResult.classification;
     logger.debug('Classification', classification as any);
 
     // Step 2: Retrieve context
@@ -809,6 +816,9 @@ program
     // Step 4: Generate answer
     console.log('Generating answer...\n');
     const answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config));
+    const totalInputTokens = classificationResult.inputTokens + answerResult.inputTokens;
+    const totalOutputTokens = classificationResult.outputTokens + answerResult.outputTokens;
+    const totalCost = classificationResult.cost + answerResult.cost;
 
     // Display answer
     const entityCount = retrieved.functions.length + retrieved.types.length +
@@ -817,22 +827,25 @@ program
     console.log(answerResult.answer);
     console.log('─'.repeat(60));
     console.log(`\nStrategy: ${classification.strategy} | Entities: ${entityCount} | Graph query: ${graphQueryTimeMs}ms`);
-    console.log(`Tokens: ${answerResult.inputTokens} in / ${answerResult.outputTokens} out | Cost: $${answerResult.cost.toFixed(4)} | Time: ${answerResult.responseTimeMs}ms`);
+    console.log(`Tokens: ${totalInputTokens} in / ${totalOutputTokens} out | Cost: $${totalCost.toFixed(4)} | Time: ${answerResult.responseTimeMs}ms`);
+    if (classificationResult.usedLlm) {
+      console.log(`  Classifier: ${classificationResult.inputTokens} in / ${classificationResult.outputTokens} out | Answer: ${answerResult.inputTokens} in / ${answerResult.outputTokens} out`);
+    }
 
     // Store in ask cache so identical questions return instantly next time
     insertCachedAskResponse(
       db, questionHash, classification.strategy, answerResult.answer,
-      config.answerModel, answerResult.inputTokens, answerResult.outputTokens, answerResult.cost,
+      config.answerModel, totalInputTokens, totalOutputTokens, totalCost,
     );
 
     // Save run to DB
     insertQaRun(db, {
       mode: 'structx',
       question,
-      input_tokens: answerResult.inputTokens,
-      output_tokens: answerResult.outputTokens,
-      total_tokens: answerResult.inputTokens + answerResult.outputTokens,
-      cost_usd: answerResult.cost,
+      input_tokens: totalInputTokens,
+      output_tokens: totalOutputTokens,
+      total_tokens: totalInputTokens + totalOutputTokens,
+      cost_usd: totalCost,
       response_time_ms: answerResult.responseTimeMs,
       files_accessed: null,
       functions_retrieved: retrieved.functions.length,

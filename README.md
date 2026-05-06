@@ -94,6 +94,8 @@ Example Claude Desktop configuration:
 
 The server exposes these tools: `structx_search`, `structx_function`, `structx_relationships`, `structx_impact`, `structx_route`, `structx_type`, `structx_file`, `structx_list`, `structx_overview`, and `structx_ask`. Each tool accepts an optional `repo_path` argument to override the server default for that call. `structx_ask` is the only LLM-backed tool; the other tools query the local SQLite graph directly.
 
+Most graph tools also accept `limit` and `detail` controls. `detail: "summary"` is the default and returns compact `structuredContent`; `detail: "full"` returns all retrieved fields. `structx_function` omits the function body by default; pass `include_body: true` when the assistant needs exact source for a target function.
+
 ## All Commands
 
 | Command | Description |

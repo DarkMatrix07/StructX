@@ -38,4 +38,11 @@ describe('classifier fast path', () => {
     expect(file?.strategy).toBe('file');
     expect(file?.filePath).toBe('src/index.ts');
   });
+
+  it('routes concept file questions to focused pattern search instead of listing every file', () => {
+    const result = classifyQuestionFastPath('what files implement authentication?');
+
+    expect(result?.strategy).toBe('pattern');
+    expect(result?.keywords).toEqual(['authentication']);
+  });
 });

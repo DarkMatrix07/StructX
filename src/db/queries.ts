@@ -90,6 +90,10 @@ export function getFunctionByName(db: Database.Database, name: string): Function
   return db.prepare('SELECT * FROM functions WHERE name = ?').get(name) as FunctionRow | undefined;
 }
 
+export function getFunctionsByName(db: Database.Database, name: string): FunctionRow[] {
+  return db.prepare('SELECT * FROM functions WHERE name = ? ORDER BY file_id, start_line').all(name) as FunctionRow[];
+}
+
 // Resolve a callee name to a function id only when the name is unambiguous.
 // Returns null when zero or multiple functions share the name. This avoids
 // silently binding cross-file relationships to the wrong function during
@@ -522,6 +526,10 @@ export function insertType(db: Database.Database, t: InsertType): number {
 
 export function getTypeByName(db: Database.Database, name: string): TypeRow | undefined {
   return db.prepare('SELECT * FROM types WHERE name = ?').get(name) as TypeRow | undefined;
+}
+
+export function getTypesByName(db: Database.Database, name: string): TypeRow[] {
+  return db.prepare('SELECT * FROM types WHERE name = ? ORDER BY file_id, start_line').all(name) as TypeRow[];
 }
 
 export function getTypesByFileId(db: Database.Database, fileId: number): TypeRow[] {

@@ -7,6 +7,7 @@ import {
   deleteFunctionsByFileId, deleteRelationshipsByCallerFunctionId,
   insertRelationship, resolveUniqueCalleeFunctionId, enqueueForAnalysis,
   resolveNullCallees, rebuildAllFtsIndexes,
+  copySemanticFields,
   insertType, deleteTypesByFileId,
   insertRoute, deleteRoutesByFileId,
   insertConstant, deleteConstantsByFileId,
@@ -97,6 +98,8 @@ export function ingestSingleFile(
         if (reanalyze) {
           enqueueForAnalysis(db, fnId, reason, getPriority(reason, fn.isExported));
           counts.queued++;
+        } else {
+          copySemanticFields(db, fnId, oldFn);
         }
       }
     }
