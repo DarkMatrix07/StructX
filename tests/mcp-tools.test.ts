@@ -12,7 +12,7 @@ import { closeAllDbs } from '../src/mcp/db-pool';
 import { registerTools } from '../src/mcp/tools';
 import { getGraphFingerprint, makeAskCacheKey } from '../src/query/ask-cache';
 import { directLookup, impactAnalysis, listQuery, patternQuery, relationshipQuery, typeQuery } from '../src/query/retriever';
-import { insertQaRun, insertType, upsertFile } from '../src/db/queries';
+import { insertQaRun, insertRoute, insertType, upsertFile } from '../src/db/queries';
 
 const cleanup: string[] = [];
 
@@ -218,7 +218,30 @@ export function useSaveB(): string {
 
   it('exposes compact schemas and body opt-in through a real MCP client', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    const { repo } = createIndexedRepo();
+    const { repo, dbPath } = createIndexedRepo();
+    const db = initializeDatabase(dbPath);
+    const routeFileId = upsertFile(db, 'src/routes/tasks.ts', 'route-fixture');
+    insertRoute(db, {
+      file_id: routeFileId,
+      method: 'POST',
+      path: '/api/tasks',
+      handler_name: 'createTaskHandler',
+      handler_body: 'createTaskHandler',
+      middleware: null,
+      start_line: 10,
+      end_line: 20,
+    });
+    insertRoute(db, {
+      file_id: routeFileId,
+      method: 'POST',
+      path: '/api/tasks/:id/archive',
+      handler_name: 'archiveTaskHandler',
+      handler_body: 'archiveTaskHandler',
+      middleware: null,
+      start_line: 30,
+      end_line: 40,
+    });
+    db.close();
     const { client, server } = await createMcpClient(repo);
 
     try {
@@ -237,7 +260,10 @@ export function useSaveB(): string {
       ]);
       const functionSchema = listed.tools.find(t => t.name === 'structx_function')?.inputSchema;
       expect(functionSchema?.properties).toHaveProperty('include_body');
+      expect(functionSchema?.properties).toHaveProperty('response_mode');
       expect(functionSchema?.additionalProperties).toBe(false);
+      const routeSchema = listed.tools.find(t => t.name === 'structx_route')?.inputSchema;
+      expect(routeSchema?.properties).toHaveProperty('path_match');
 
       const defaultResult = await client.callTool({
         name: 'structx_function',
@@ -252,6 +278,30 @@ export function useSaveB(): string {
       });
       expect(fullResult.content[0]).toMatchObject({ type: 'text' });
       expect(JSON.stringify(fullResult.structuredContent)).toContain('return { subtotal');
+
+      const structuredOnly = await client.callTool({
+        name: 'structx_list',
+        arguments: { entity: 'functions', response_mode: 'structured' },
+      });
+      expect((structuredOnly.content[0] as any).text).toMatch(/^Structured results returned/);
+      expect((structuredOnly.content[0] as any).text).not.toContain('calculateInvoice');
+      expect(JSON.stringify(structuredOnly.structuredContent)).toContain('calculateInvoice');
+
+      const textOnly = await client.callTool({
+        name: 'structx_list',
+        arguments: { entity: 'functions', response_mode: 'text' },
+      });
+      expect((textOnly.content[0] as any).text).toContain('calculateInvoice');
+      expect(textOnly.structuredContent).toMatchObject({
+        omitted: true,
+        reason: 'response_mode=text',
+      });
+
+      const exactRoute = await client.callTool({
+        name: 'structx_route',
+        arguments: { path: '/api/tasks', method: 'POST', path_match: 'exact', response_mode: 'structured' },
+      });
+      expect((exactRoute.structuredContent as any).routes.map((r: any) => r.path)).toEqual(['/api/tasks']);
 
       const rejected = await client.callTool({
         name: 'structx_search',
@@ -271,6 +321,8 @@ export function useSaveB(): string {
 
     const beforeHash = getGraphFingerprint(db);
     const beforeKey = makeAskCacheKey('what does printInvoice do?', 'answer-model', beforeHash);
+    const lowBudgetKey = makeAskCacheKey('what does printInvoice do?', 'answer-model', beforeHash, 128);
+    const highBudgetKey = makeAskCacheKey('what does printInvoice do?', 'answer-model', beforeHash, 512);
 
     writeProject(repo, 'changed');
     ingestDirectory(db, repo, 0.2);
@@ -281,6 +333,7 @@ export function useSaveB(): string {
 
     expect(afterHash).not.toBe(beforeHash);
     expect(afterKey).not.toBe(beforeKey);
+    expect(lowBudgetKey).not.toBe(highBudgetKey);
   });
 
   it('keeps graph fingerprints stable when only QA run history changes', () => {

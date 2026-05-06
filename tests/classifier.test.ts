@@ -45,4 +45,11 @@ describe('classifier fast path', () => {
     expect(result?.strategy).toBe('pattern');
     expect(result?.keywords).toEqual(['authentication']);
   });
+
+  it('routes route concept questions to focused route search instead of listing every route', () => {
+    const result = classifyQuestionFastPath('what route creates tasks?');
+
+    expect(result?.strategy).toBe('route');
+    expect(result?.keywords).toEqual(['creates', 'tasks']);
+  });
 });

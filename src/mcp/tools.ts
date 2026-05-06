@@ -2,7 +2,7 @@ import { z } from 'zod/v3';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   directLookup, relationshipQuery, semanticSearch, patternQuery,
-  impactAnalysis, routeQuery, typeQuery, fileQuery, listQuery,
+  impactAnalysis, routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery,
   domainQuery,
 } from '../query/retriever';
 import {
@@ -22,17 +22,21 @@ import { formatContext, formatFunction, formatType, formatRoute, formatFile } fr
 const RepoPath = z.string().optional().describe('Absolute path to the repo. Defaults to the server\'s --repo arg or cwd.');
 const Detail = z.enum(['summary', 'full']).optional().describe('summary returns compact structuredContent (default); full returns all retrieved fields.');
 const Limit = z.number().int().min(1).max(100).optional().describe('Maximum rows per entity kind in this response.');
+const ResponseMode = z.enum(['both', 'text', 'structured']).optional().describe('both returns markdown and structuredContent (default); text keeps markdown and returns only count metadata; structured keeps structuredContent and returns a short text stub.');
+const AskMaxTokens = z.number().int().min(64).max(8192).optional().describe('Maximum answer output tokens for this call. Defaults to .structx/config.json answerMaxTokens.');
 const SearchArgs = z.object({
   keywords: z.array(z.string()).min(1).describe('Search terms (e.g. ["auth", "login"]). FTS-sanitized internally.'),
   mode: z.enum(['narrow', 'broad']).optional().describe('narrow = fewer high-precision results (default); broad = wider net for cross-cutting concerns.'),
   limit: Limit,
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const FunctionArgs = z.object({
   name: z.string().describe('Exact function name.'),
   include_body: z.boolean().optional().describe('Include the full function body in text and structuredContent. Defaults to false.'),
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const RelationshipArgs = z.object({
@@ -40,45 +44,54 @@ const RelationshipArgs = z.object({
   direction: z.enum(['callers', 'callees']).describe('callers = who invokes this function; callees = what this function invokes.'),
   limit: Limit,
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const ImpactArgs = z.object({
   name: z.string().describe('Exact function name.'),
   limit: Limit,
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const RouteArgs = z.object({
   path: z.string().optional().describe('Path or substring (e.g. "/users", "/api"). Matches anywhere in the route path.'),
   method: z.string().optional().describe('HTTP method filter (GET, POST, etc.). Case-insensitive.'),
+  path_match: z.enum(['contains', 'exact']).optional().describe('Path matching behavior when path is provided. Defaults to contains.'),
   limit: Limit,
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const TypeArgs = z.object({
   name: z.string().describe('Type/interface/enum name.'),
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const FileArgs = z.object({
   path: z.string().optional().describe('File path relative to repo (e.g. "src/auth.ts"). Empty = all files summary.'),
   limit: Limit,
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const ListArgs = z.object({
   entity: z.enum(['routes', 'types', 'files', 'functions', 'constants']).optional().describe('Kind to enumerate. Omit for a mixed cross-section.'),
   limit: Limit,
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const OverviewArgs = z.object({
   max_items: z.number().int().min(1).max(100).optional().describe('Maximum rows per overview section. Defaults to 10.'),
   detail: Detail,
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 const AskArgs = z.object({
   question: z.string().describe('Natural language question (e.g. "How is authentication handled?").'),
+  max_tokens: AskMaxTokens,
   repo_path: RepoPath,
 }).strict();
 
@@ -137,6 +150,60 @@ async function withDbAsync<T>(
     }
     return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
   }
+}
+
+type ResponseModeValue = 'both' | 'text' | 'structured' | undefined;
+
+function toolResponse(
+  text: string,
+  structuredContent: any,
+  responseMode?: ResponseModeValue,
+  isError?: boolean,
+): { content: { type: 'text'; text: string }[]; structuredContent?: any; isError?: boolean } {
+  const response = responseMode === 'structured'
+    ? {
+      content: [{ type: 'text' as const, text: structuredTextSummary(structuredContent) }],
+      structuredContent,
+    }
+    : responseMode === 'text'
+      ? {
+        content: [{ type: 'text' as const, text }],
+        structuredContent: textOnlyStructuredSummary(structuredContent),
+      }
+      : {
+        content: [{ type: 'text' as const, text }],
+        structuredContent,
+      };
+
+  return isError ? { ...response, isError: true } : response;
+}
+
+function countStructuredContent(structuredContent: any): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const key of ['files', 'functions', 'types', 'routes', 'constants']) {
+    if (Array.isArray(structuredContent?.[key])) {
+      counts[key] = structuredContent[key].length;
+    }
+  }
+  if (structuredContent?.stats) counts.stats = 1;
+  return counts;
+}
+
+function formatCounts(counts: Record<string, number>): string {
+  const parts = Object.entries(counts).map(([key, value]) => `${key}: ${value}`);
+  return parts.length > 0 ? parts.join(', ') : 'no entity rows';
+}
+
+function structuredTextSummary(structuredContent: any): string {
+  return `Structured results returned (${formatCounts(countStructuredContent(structuredContent))}).`;
+}
+
+function textOnlyStructuredSummary(structuredContent: any): any {
+  return {
+    omitted: true,
+    reason: 'response_mode=text',
+    counts: countStructuredContent(structuredContent),
+  };
 }
 
 function limitContext(ctx: any, limit?: number): any {
@@ -276,7 +343,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
       ? patternQuery(db, args.keywords)
       : semanticSearch(db, args.keywords), args.limit);
     const text = formatContext(ctx, `Search results for: ${args.keywords.join(', ')}`);
-    return { content: [{ type: 'text' as const, text }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(text, structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 2. structx_function ────────────────────────────────────────────────
@@ -286,10 +353,10 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = addFunctionBody(db, directLookup(db, args.name), args.name, args.include_body);
     if (ctx.functions.length === 0) {
-      return { content: [{ type: 'text' as const, text: `No function named '${args.name}' found.` }], structuredContent: structuredContext(ctx, args.detail) };
+      return toolResponse(`No function named '${args.name}' found.`, structuredContext(ctx, args.detail), args.response_mode);
     }
     const text = ctx.functions.map((fn: any) => formatFunctionResult(fn, args.include_body)).join('\n\n');
-    return { content: [{ type: 'text' as const, text }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(text, structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 3. structx_relationships ──────────────────────────────────────────
@@ -299,7 +366,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = limitContext(relationshipQuery(db, args.name, args.direction), args.limit);
     const header = args.direction === 'callers' ? `Callers of ${args.name}` : `Callees of ${args.name}`;
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, header) }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(formatContext(ctx, header), structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 4. structx_impact ──────────────────────────────────────────────────
@@ -308,7 +375,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     inputSchema: ImpactArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = limitContext(impactAnalysis(db, args.name), args.limit);
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, `Impact of changing ${args.name}`) }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(formatContext(ctx, `Impact of changing ${args.name}`), structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 5. structx_route ───────────────────────────────────────────────────
@@ -316,8 +383,12 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     description: 'Find HTTP routes by path pattern and/or method. Both args optional — empty call returns all routes.',
     inputSchema: RouteArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = limitContext(routeQuery(db, args.path ?? null, args.method ?? null), args.limit);
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, 'Routes') }], structuredContent: structuredContext(ctx, args.detail) };
+    const routed = routeQuery(db, args.path ?? null, args.method ?? null);
+    const matched = args.path && args.path_match === 'exact'
+      ? { ...routed, routes: routed.routes.filter((route: any) => route.path === args.path) }
+      : routed;
+    const ctx = limitContext(matched, args.limit);
+    return toolResponse(formatContext(ctx, 'Routes'), structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 6. structx_type ────────────────────────────────────────────────────
@@ -327,10 +398,10 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = typeQuery(db, args.name);
     if (ctx.types.length === 0) {
-      return { content: [{ type: 'text' as const, text: `No type named '${args.name}' found.` }], structuredContent: structuredContext(ctx, args.detail) };
+      return toolResponse(`No type named '${args.name}' found.`, structuredContext(ctx, args.detail), args.response_mode);
     }
     const text = ctx.types.map(formatType).join('\n\n');
-    return { content: [{ type: 'text' as const, text }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(text, structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 7. structx_file ────────────────────────────────────────────────────
@@ -340,9 +411,9 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = limitContext(fileQuery(db, args.path ?? null), args.limit);
     if (args.path && ctx.functions.length === 0 && ctx.types.length === 0 && ctx.routes.length === 0 && ctx.files.length === 0) {
-      return { content: [{ type: 'text' as const, text: `File '${args.path}' not found in graph.` }], structuredContent: structuredContext(ctx, args.detail), isError: true };
+      return toolResponse(`File '${args.path}' not found in graph.`, structuredContext(ctx, args.detail), args.response_mode, true);
     }
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, args.path ? `File: ${args.path}` : 'All files') }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(formatContext(ctx, args.path ? `File: ${args.path}` : 'All files'), structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 8. structx_list ────────────────────────────────────────────────────
@@ -351,7 +422,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     inputSchema: ListArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = limitContext(listQuery(db, args.entity ?? null, args.limit ?? 50), args.limit);
-    return { content: [{ type: 'text' as const, text: formatContext(ctx, args.entity ? `All ${args.entity}` : 'Repo overview') }], structuredContent: structuredContext(ctx, args.detail) };
+    return toolResponse(formatContext(ctx, args.entity ? `All ${args.entity}` : 'Repo overview'), structuredContext(ctx, args.detail), args.response_mode);
   }));
 
   // ── 9. structx_overview ────────────────────────────────────────────────
@@ -410,7 +481,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
       lines.push('', `_Showing first ${maxItems} rows per section._`);
     }
 
-    return { content: [{ type: 'text' as const, text: lines.join('\n') }], structuredContent: structured };
+    return toolResponse(lines.join('\n'), structured, args.response_mode);
   }));
 
   // ── 10. structx_ask ────────────────────────────────────────────────────
@@ -419,10 +490,11 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     inputSchema: AskArgs,
   }, async (args: any) => withDbAsync(defaultRepo, args.repo_path, async (db, repo) => {
     const config = loadConfig(getStructXDir(repo));
+    const answerMaxTokens = args.max_tokens ?? config.answerMaxTokens;
 
     // Cache check — same key the CLI uses.
     const graphHash = getGraphFingerprint(db);
-    const questionHash = makeAskCacheKey(args.question, config.answerModel, graphHash);
+    const questionHash = makeAskCacheKey(args.question, config.answerModel, graphHash, answerMaxTokens);
     const cached = getCachedAskResponse(db, questionHash);
     if (cached) {
       return {
@@ -433,6 +505,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
           cached: true,
           inputTokens: cached.input_tokens ?? 0,
           outputTokens: cached.output_tokens ?? 0,
+          answerMaxTokens,
           cost: 0,
           graphHash,
         },
@@ -463,7 +536,11 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
       case 'semantic': retrieved = semanticSearch(db, classification.keywords); break;
       case 'domain': retrieved = domainQuery(db, classification.domain || 'other'); break;
       case 'impact': retrieved = impactAnalysis(db, classification.functionName || ''); break;
-      case 'route': retrieved = routeQuery(db, classification.routePath, classification.routeMethod); break;
+      case 'route':
+        retrieved = classification.routePath || classification.keywords.length === 0
+          ? routeQuery(db, classification.routePath, classification.routeMethod)
+          : routeKeywordQuery(db, classification.keywords, classification.routeMethod);
+        break;
       case 'type': retrieved = typeQuery(db, classification.typeName || classification.keywords.join(' ')); break;
       case 'file': retrieved = fileQuery(db, classification.filePath); break;
       case 'list': retrieved = listQuery(db, classification.listEntity); break;
@@ -473,7 +550,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     const graphQueryTimeMs = Date.now() - graphQueryStart;
 
     const context = buildContext(retrieved, args.question);
-    const answerResult = await generateAnswer(args.question, context, config.answerModel, getLlmConfig(config));
+    const answerResult = await generateAnswer(args.question, context, config.answerModel, getLlmConfig(config), answerMaxTokens);
 
     const totalInputTokens = classificationResult.inputTokens + answerResult.inputTokens;
     const totalOutputTokens = classificationResult.outputTokens + answerResult.outputTokens;
@@ -510,6 +587,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
         classifierOutputTokens: classificationResult.outputTokens,
         answerInputTokens: answerResult.inputTokens,
         answerOutputTokens: answerResult.outputTokens,
+        answerMaxTokens,
         cost: totalCost,
         classifierCost: classificationResult.cost,
         answerCost: answerResult.cost,

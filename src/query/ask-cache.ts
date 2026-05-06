@@ -90,8 +90,14 @@ function countRows(db: Database.Database, table: string): number {
   }
 }
 
-export function makeAskCacheKey(question: string, answerModel: string, graphFingerprint: string): string {
+export function makeAskCacheKey(
+  question: string,
+  answerModel: string,
+  graphFingerprint: string,
+  answerMaxTokens?: number,
+): string {
+  const tokenBudget = answerMaxTokens === undefined ? 'default' : String(answerMaxTokens);
   return crypto.createHash('sha256')
-    .update(`${question.toLowerCase().trim()}|${answerModel}|${graphFingerprint}`)
+    .update(`${question.toLowerCase().trim()}|${answerModel}|max:${tokenBudget}|${graphFingerprint}`)
     .digest('hex');
 }

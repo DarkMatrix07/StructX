@@ -94,7 +94,11 @@ Example Claude Desktop configuration:
 
 The server exposes these tools: `structx_search`, `structx_function`, `structx_relationships`, `structx_impact`, `structx_route`, `structx_type`, `structx_file`, `structx_list`, `structx_overview`, and `structx_ask`. Each tool accepts an optional `repo_path` argument to override the server default for that call. `structx_ask` is the only LLM-backed tool; the other tools query the local SQLite graph directly.
 
-Most graph tools also accept `limit` and `detail` controls. `detail: "summary"` is the default and returns compact `structuredContent`; `detail: "full"` returns all retrieved fields. `structx_function` omits the function body by default; pass `include_body: true` when the assistant needs exact source for a target function.
+Most graph tools also accept `limit`, `detail`, and `response_mode` controls. `detail: "summary"` is the default and returns compact `structuredContent`; `detail: "full"` returns all retrieved fields. `response_mode: "both"` is the default, `response_mode: "structured"` returns a short text stub plus full structured data, and `response_mode: "text"` keeps markdown while replacing structured data with counts. `structx_function` omits the function body by default; pass `include_body: true` when the assistant needs exact source for a target function.
+
+`structx_route` also accepts `path_match: "exact"` when an assistant needs `/api/tasks` without substring matches like `/api/tasks/:id/archive`.
+
+`structx_ask` accepts `max_tokens` per MCP call. The CLI equivalent is `structx ask "question" --max-tokens 512`; the project-wide default is `answerMaxTokens` in `.structx/config.json` and defaults to `1024`.
 
 ## All Commands
 

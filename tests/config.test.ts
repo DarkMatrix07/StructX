@@ -47,4 +47,26 @@ describe('config loading', () => {
     expect(config.classifierModel).toBe('legacy/query-model');
     expect(config.answerModel).toBe('legacy/query-model');
   });
+
+  it('loads a bounded answer token budget with a safe default', () => {
+    const repo = join(tmpdir(), `structx-config-test-${Date.now()}`);
+    cleanup.push(repo);
+    const structxDir = join(repo, '.structx');
+    mkdirSync(structxDir, { recursive: true });
+    writeFileSync(join(structxDir, 'config.json'), JSON.stringify({
+      repoPath: repo,
+      provider: 'openrouter',
+      answerMaxTokens: 320,
+    }));
+
+    expect(loadConfig(structxDir).answerMaxTokens).toBe(320);
+
+    writeFileSync(join(structxDir, 'config.json'), JSON.stringify({
+      repoPath: repo,
+      provider: 'openrouter',
+      answerMaxTokens: 99999,
+    }));
+
+    expect(loadConfig(structxDir).answerMaxTokens).toBe(8192);
+  });
 });

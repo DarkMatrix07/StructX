@@ -18,6 +18,7 @@ export async function runBaseline(
   repoPath: string,
   model: string,
   llmConfig: LlmClientConfig,
+  maxTokens = 1024,
 ): Promise<BaselineResult> {
   const client = createLlmClient(llmConfig);
 
@@ -43,7 +44,7 @@ Question: ${question}`;
   const { text, inputTokens, outputTokens } = await client.complete({
     model,
     prompt,
-    maxTokens: 1024,
+    maxTokens,
   });
   const responseTimeMs = Date.now() - startTime;
 

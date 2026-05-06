@@ -79,12 +79,28 @@ function extractFilePath(q: string): string | null {
 }
 
 function matchListEntity(lower: string): string | null {
-  if (/\b(all\s+)?routes?\b/.test(lower) && !/\bwhat\s+calls?\b/.test(lower)) return 'routes';
+  const routeListQuestion =
+    /\b(?:list|show)\s+(?:all\s+)?routes?\b/.test(lower) ||
+    /\b(?:what|which)\s+routes?\s+(?:exist|are\s+available)\b/.test(lower) ||
+    /\ball\s+routes?\b/.test(lower);
+  if (routeListQuestion && !/\bwhat\s+calls?\b/.test(lower)) return 'routes';
   if (/\b(all\s+)?types?\b/.test(lower) && !/\bwhat\s+(?:is|are)\s+the\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'types';
   if (/\b(all\s+)?(?:interfaces?|enums?)\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'types';
   if (/\b(all\s+)?(?:files?|modules?)\b/.test(lower) && !/\bwhat(?:'s|\s+is)\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'files';
   if (/\b(all\s+)?constants?\b/.test(lower) && !/\bcalls?\b/.test(lower)) return 'constants';
   return null;
+}
+
+function extractSearchKeywords(text: string, extraStopWords: string[] = []): string[] {
+  const stopWords = new Set([
+    'what', 'which', 'show', 'list', 'all', 'does', 'do', 'the', 'for', 'with', 'that',
+    'this', 'are', 'is', 'me', 'route', 'routes', 'endpoint', 'endpoints',
+    ...extraStopWords,
+  ]);
+  return text
+    .split(/\s+/)
+    .map(w => w.replace(/[^A-Za-z0-9_$-]/g, '').trim().toLowerCase())
+    .filter(w => w.length > 2 && !stopWords.has(w));
 }
 
 // Priority order (high → low):
@@ -144,10 +160,7 @@ export function classifyQuestionFastPath(question: string): ClassificationResult
 
   const conceptFiles = q.match(/\bwhat\s+(?:files?|modules?)\s+(?:implement|handle|contain|use|define|support)\s+(.+?)\??$/i);
   if (conceptFiles) {
-    const keywords = conceptFiles[1]
-      .split(/\s+/)
-      .map(w => w.replace(/[^A-Za-z0-9_$-]/g, '').trim())
-      .filter(w => w.length > 2);
+    const keywords = extractSearchKeywords(conceptFiles[1]);
     return baseResult({ strategy: 'pattern', keywords });
   }
 
@@ -161,6 +174,16 @@ export function classifyQuestionFastPath(question: string): ClassificationResult
     q.match(/(\/api\/[^\s"'`?]+)/i);
   if (bareRoute) {
     return baseResult({ strategy: 'route', routePath: bareRoute[1] });
+  }
+  const routeListQuestion =
+    /\b(?:list|show)\s+(?:all\s+)?routes?\b/i.test(q) ||
+    /\b(?:what|which)\s+routes?\s+(?:exist|are\s+available)\b/i.test(q) ||
+    /\ball\s+routes?\b/i.test(q);
+  if (/\b(?:routes?|endpoints?)\b/i.test(q) && !routeListQuestion) {
+    const keywords = extractSearchKeywords(q);
+    if (keywords.length > 0) {
+      return baseResult({ strategy: 'route', keywords });
+    }
   }
 
   // 6. Type

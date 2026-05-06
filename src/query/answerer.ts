@@ -27,13 +27,14 @@ export async function generateAnswer(
   context: string,
   model: string,
   llmConfig: LlmClientConfig,
+  maxTokens = 1024,
 ): Promise<AnswerResult> {
   const client = createLlmClient(llmConfig);
   const startTime = Date.now();
 
   const { text, inputTokens, outputTokens } = await client.complete({
     model,
-    maxTokens: 1024,
+    maxTokens,
     system: SYSTEM_PROMPT,
     prompt: `${context}\n\nQuestion: ${question}`,
   });

@@ -4,7 +4,10 @@ import { getLlmConfig } from '../config';
 import { BENCHMARK_QUESTIONS } from './questions';
 import { runBaseline } from './baseline';
 import { classifyQuestion } from '../query/classifier';
-import { directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis } from '../query/retriever';
+import {
+  directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis,
+  routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery, patternQuery,
+} from '../query/retriever';
 import { buildContext } from '../query/context-builder';
 import { generateAnswer } from '../query/answerer';
 import { insertQaRun } from '../db/queries';
@@ -68,13 +71,30 @@ export async function runBenchmark(
         case 'impact':
           retrieved = impactAnalysis(db, classification.functionName || '');
           break;
+        case 'route':
+          retrieved = classification.routePath || classification.keywords.length === 0
+            ? routeQuery(db, classification.routePath, classification.routeMethod)
+            : routeKeywordQuery(db, classification.keywords, classification.routeMethod);
+          break;
+        case 'type':
+          retrieved = typeQuery(db, classification.typeName || classification.keywords.join(' '));
+          break;
+        case 'file':
+          retrieved = fileQuery(db, classification.filePath);
+          break;
+        case 'list':
+          retrieved = listQuery(db, classification.listEntity);
+          break;
+        case 'pattern':
+          retrieved = patternQuery(db, classification.keywords);
+          break;
         default:
           retrieved = semanticSearch(db, classification.keywords);
       }
       const graphQueryTimeMs = Date.now() - graphQueryStart;
 
       const context = buildContext(retrieved, question);
-      const answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config));
+      const answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config), config.answerMaxTokens);
 
       result.structx = {
         answer: answerResult.answer,
@@ -109,7 +129,7 @@ export async function runBenchmark(
     // Run Traditional agent
     try {
       console.log('  Running Traditional agent...');
-      const baseline = await runBaseline(question, config.repoPath, config.answerModel, getLlmConfig(config));
+      const baseline = await runBaseline(question, config.repoPath, config.answerModel, getLlmConfig(config), config.answerMaxTokens);
 
       result.traditional = {
         answer: baseline.answer,

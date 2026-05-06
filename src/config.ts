@@ -12,6 +12,7 @@ export interface StructXConfig {
   analysisModel: string;
   classifierModel: string;
   answerModel: string;
+  answerMaxTokens: number;
   batchSize: number;
   diffThreshold: number;
   structxDir: string;
@@ -31,6 +32,7 @@ const OPENROUTER_DEFAULTS = {
 };
 
 const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'structxDir' | 'provider' | 'analysisModel' | 'classifierModel' | 'answerModel'> = {
+  answerMaxTokens: 1024,
   batchSize: 8,
   diffThreshold: 0.3,
 };
@@ -74,9 +76,24 @@ export function loadConfig(structxDir: string): StructXConfig {
     provider,
     classifierModel: raw.classifierModel ?? raw.queryModel ?? providerDefaults.classifierModel,
     answerModel: raw.answerModel ?? raw.queryModel ?? providerDefaults.answerModel,
+    answerMaxTokens: normalizeAnswerMaxTokens(raw.answerMaxTokens),
     anthropicApiKey: apiKey,
     structxDir,
   };
+}
+
+function normalizeAnswerMaxTokens(value: unknown): number {
+  const parsed = typeof value === 'number'
+    ? value
+    : typeof value === 'string'
+      ? Number(value)
+      : DEFAULT_CONFIG.answerMaxTokens;
+
+  if (!Number.isFinite(parsed)) return DEFAULT_CONFIG.answerMaxTokens;
+  const integer = Math.floor(parsed);
+  if (integer < 64) return 64;
+  if (integer > 8192) return 8192;
+  return integer;
 }
 
 function resolveConfiguredRepoPath(rawRepoPath: string | undefined, structxDir: string): string {

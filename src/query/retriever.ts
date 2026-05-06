@@ -293,6 +293,27 @@ export function routeQuery(db: Database.Database, routePath?: string | null, met
   };
 }
 
+export function routeKeywordQuery(db: Database.Database, keywords: string[], method?: string | null): RetrievedContext {
+  const broadQuery = sanitizeFtsTerms(keywords);
+  if (!broadQuery) return emptyContext('route');
+
+  const strictQuery = broadQuery.replace(/\s+OR\s+/g, ' ');
+  let routes = searchRoutes(db, strictQuery, 10);
+  if (routes.length === 0 && strictQuery !== broadQuery) {
+    routes = searchRoutes(db, broadQuery, 10);
+  }
+
+  if (method) {
+    routes = routes.filter(r => r.method === method.toUpperCase());
+  }
+
+  const cache = buildEnrichCache(db, [], [], routes);
+  return {
+    ...emptyContext('route'),
+    routes: routes.map(r => enrichRoute(db, r, cache)),
+  };
+}
+
 export function typeQuery(db: Database.Database, typeName: string): RetrievedContext {
   const exactTypes = getTypesByName(db, typeName);
   if (exactTypes.length === 0) {

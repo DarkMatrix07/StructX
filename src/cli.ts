@@ -12,7 +12,7 @@ import { analyzeBatch, rebuildSearchIndex, analyzeTypes, analyzeRoutes, analyzeF
 import { estimateAnalysisCost, formatCostEstimate } from './semantic/cost';
 import { getPendingAnalysis, getPendingAnalysisCount, enqueueUnanalyzedFunctions, insertQaRun, getCachedAskResponse, insertCachedAskResponse } from './db/queries';
 import { classifyQuestionWithUsage } from './query/classifier';
-import { directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
+import { directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
 import { buildContext } from './query/context-builder';
 import { generateAnswer } from './query/answerer';
 import { getGraphFingerprint, makeAskCacheKey } from './query/ask-cache';
@@ -23,6 +23,25 @@ import { watchDirectory } from './watch/watcher';
 import { runMcpServer } from './mcp/server';
 
 const program = new Command();
+
+function parseMaxTokens(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 64 || parsed > 8192) {
+    throw new Error('--max-tokens must be an integer between 64 and 8192');
+  }
+  return parsed;
+}
+
+function formatProviderError(err: any): string {
+  const message = err?.message || String(err);
+  if (err?.status === 402 || /insufficient credits/i.test(message)) {
+    return 'provider returned 402 insufficient credits. Add credits or use a different provider/key.';
+  }
+  if (/api key/i.test(message) || err?.status === 401) {
+    return 'provider authentication failed. Check the configured API key and provider.';
+  }
+  return message;
+}
 
 program
   .name('structx')
@@ -646,7 +665,8 @@ program
   .option('--repo <path>', 'Path to TypeScript repository', '.')
   .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
   .option('--provider <name>', 'LLM provider: anthropic | openrouter')
-  .action(async (question: string, opts: { repo: string; apiKey?: string; provider?: string }) => {
+  .option('--max-tokens <n>', 'Maximum answer output tokens for this ask (64-8192)', parseMaxTokens)
+  .action(async (question: string, opts: { repo: string; apiKey?: string; provider?: string; maxTokens?: number }) => {
     const resolved = path.resolve(opts.repo);
     const structxDir = getStructXDir(resolved);
     const dbPath = getDbPath(structxDir);
@@ -700,6 +720,7 @@ program
       config.provider = opts.provider;
     }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
+    const answerMaxTokens = opts.maxTokens ?? config.answerMaxTokens;
     if (!config.anthropicApiKey) {
       console.log(`ERROR: API key not set for provider '${config.provider}'.`);
       console.log('Fix one of:');
@@ -745,7 +766,7 @@ program
     // Cache check: include the graph fingerprint so changed code or updated
     // semantic metadata cannot return a stale answer for the same question.
     const graphHash = getGraphFingerprint(db);
-    const questionHash = makeAskCacheKey(question, config.answerModel, graphHash);
+    const questionHash = makeAskCacheKey(question, config.answerModel, graphHash, answerMaxTokens);
     const cached = getCachedAskResponse(db, questionHash);
     if (cached) {
       const entityCount = 0;
@@ -760,7 +781,14 @@ program
 
     // Step 1: Classify the question
     console.log('Classifying question...');
-    const classificationResult = await classifyQuestionWithUsage(question, config.classifierModel, getLlmConfig(config));
+    let classificationResult: Awaited<ReturnType<typeof classifyQuestionWithUsage>>;
+    try {
+      classificationResult = await classifyQuestionWithUsage(question, config.classifierModel, getLlmConfig(config));
+    } catch (err: any) {
+      console.log(`ERROR: Question classification failed: ${formatProviderError(err)}`);
+      db.close();
+      return;
+    }
     const classification = classificationResult.classification;
     logger.debug('Classification', classification as any);
 
@@ -790,7 +818,9 @@ program
         retrieved = impactAnalysis(db, classification.functionName || '');
         break;
       case 'route':
-        retrieved = routeQuery(db, classification.routePath, classification.routeMethod);
+        retrieved = classification.routePath || classification.keywords.length === 0
+          ? routeQuery(db, classification.routePath, classification.routeMethod)
+          : routeKeywordQuery(db, classification.keywords, classification.routeMethod);
         break;
       case 'type':
         retrieved = typeQuery(db, classification.typeName || classification.keywords.join(' '));
@@ -815,7 +845,15 @@ program
 
     // Step 4: Generate answer
     console.log('Generating answer...\n');
-    const answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config));
+    let answerResult: Awaited<ReturnType<typeof generateAnswer>>;
+    try {
+      answerResult = await generateAnswer(question, context, config.answerModel, getLlmConfig(config), answerMaxTokens);
+    } catch (err: any) {
+      console.log(`ERROR: Answer generation failed: ${formatProviderError(err)}`);
+      console.log('Graph retrieval completed; graph-only commands and MCP graph tools still work without LLM credits.');
+      db.close();
+      return;
+    }
     const totalInputTokens = classificationResult.inputTokens + answerResult.inputTokens;
     const totalOutputTokens = classificationResult.outputTokens + answerResult.outputTokens;
     const totalCost = classificationResult.cost + answerResult.cost;
