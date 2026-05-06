@@ -20,6 +20,7 @@ import { runBenchmark } from './benchmark/runner';
 import { generateMarkdownReport, generateCsvReport, saveReport } from './benchmark/reporter';
 import { ingestDirectory, printIngestResult } from './ingest/ingester';
 import { watchDirectory } from './watch/watcher';
+import { runMcpServer } from './mcp/server';
 
 const program = new Command();
 
@@ -504,6 +505,20 @@ program
     };
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+  });
+
+// ── mcp ──
+program
+  .command('mcp')
+  .description('Run as a Model Context Protocol server (stdio) for use by AI editors')
+  .argument('[repo-path]', 'Default repo for tool calls', '.')
+  .option('--repo <path>', 'Default repo for tool calls (overrides positional arg)')
+  .action(async (repoPath: string, opts: { repo?: string }) => {
+    const resolved = path.resolve(opts.repo ?? repoPath);
+    // The MCP server speaks JSON-RPC over stdout, so any console.log() would
+    // corrupt the protocol. runMcpServer logs everything via the stderr-only
+    // logger and blocks until the parent disconnects.
+    await runMcpServer(resolved);
   });
 
 // ── analyze ──

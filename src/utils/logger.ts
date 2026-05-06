@@ -29,13 +29,13 @@ function formatMessage(level: LogLevel, message: string, data?: Record<string, u
 export const logger = {
   debug(message: string, data?: Record<string, unknown>): void {
     if (shouldLog('debug')) {
-      console.debug(formatMessage('debug', message, data));
+      console.error(formatMessage('debug', message, data));
     }
   },
 
   info(message: string, data?: Record<string, unknown>): void {
     if (shouldLog('info')) {
-      console.log(formatMessage('info', message, data));
+      console.error(formatMessage('info', message, data));
     }
   },
 

@@ -274,11 +274,12 @@ export function routeQuery(db: Database.Database, routePath?: string | null, met
     routes = db.prepare(
       'SELECT * FROM routes WHERE path LIKE ?'
     ).all(`%${routePath}%`) as RouteRow[];
-    if (method) {
-      routes = routes.filter(r => r.method === method.toUpperCase());
-    }
   } else {
     routes = getAllRoutes(db);
+  }
+
+  if (method) {
+    routes = routes.filter(r => r.method === method.toUpperCase());
   }
 
   const cache = buildEnrichCache(db, [], [], routes);

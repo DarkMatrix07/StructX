@@ -71,6 +71,29 @@ Once installed, the instruction files tell your AI agent to:
 4. Run `npx structx analyze . --yes` after ingestion queues new functions
 5. Run `npx structx ask "what breaks if I change X" --repo .` for impact analysis
 
+## MCP Integration
+
+StructX can run as a Model Context Protocol server over stdio, so MCP-aware editors can call the knowledge graph directly instead of shelling out to `structx ask`.
+
+```bash
+structx mcp --repo /abs/path/to/your/repo
+```
+
+Example Claude Desktop configuration:
+
+```json
+{
+  "mcpServers": {
+    "structx": {
+      "command": "structx",
+      "args": ["mcp", "--repo", "/abs/path/to/your/repo"]
+    }
+  }
+}
+```
+
+The server exposes these tools: `structx_search`, `structx_function`, `structx_relationships`, `structx_impact`, `structx_route`, `structx_type`, `structx_file`, `structx_list`, `structx_overview`, and `structx_ask`. Each tool accepts an optional `repo_path` argument to override the server default for that call. `structx_ask` is the only LLM-backed tool; the other tools query the local SQLite graph directly.
+
 ## All Commands
 
 | Command | Description |
@@ -82,6 +105,7 @@ Once installed, the instruction files tell your AI agent to:
 | `npx structx ingest .` | Re-parse codebase after changes |
 | `npx structx analyze . --yes` | Run semantic analysis on new/changed functions |
 | `npx structx ask "question" --repo .` | Query the function graph |
+| `npx structx mcp --repo .` | Run the MCP server over stdio |
 | `npx structx doctor` | Validate environment and configuration |
 | `npx structx benchmark run --repo .` | Run comparison benchmark (StructX vs traditional) |
 
