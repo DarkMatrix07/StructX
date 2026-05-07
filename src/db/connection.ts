@@ -9,12 +9,27 @@ export function getDbPath(structxDir: string): string {
   return path.join(structxDir, 'db.sqlite');
 }
 
-export function openDatabase(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
-  normalizeExistingFilePaths(db);
+export interface OpenDbOptions {
+  // When true, opens with SQLITE_OPEN_READONLY and skips migrations + path
+  // normalization (both of which would attempt writes). Used by `structx mcp
+  // --readonly` so MCP servers can attach to a graph maintained by another
+  // process without risking accidental schema changes.
+  readonly?: boolean;
+}
+
+export function openDatabase(dbPath: string, opts: OpenDbOptions = {}): Database.Database {
+  const db = new Database(dbPath, opts.readonly ? { readonly: true } : undefined);
+  if (!opts.readonly) {
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+    runMigrations(db);
+    normalizeExistingFilePaths(db);
+  } else {
+    // Readonly connections still benefit from foreign_keys ON for joins on
+    // tables that reference deleted rows; this pragma is a no-op when the
+    // file is opened readonly but harmless to set.
+    db.pragma('foreign_keys = ON');
+  }
   return db;
 }
 

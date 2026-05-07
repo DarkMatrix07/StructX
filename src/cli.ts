@@ -533,12 +533,13 @@ program
   .description('Run as a Model Context Protocol server (stdio) for use by AI editors')
   .argument('[repo-path]', 'Default repo for tool calls', '.')
   .option('--repo <path>', 'Default repo for tool calls (overrides positional arg)')
-  .action(async (repoPath: string, opts: { repo?: string }) => {
+  .option('--readonly', 'Open the graph DB readonly and disable structx_ask. Useful for shared repos where MCP should never mutate state.')
+  .action(async (repoPath: string, opts: { repo?: string; readonly?: boolean }) => {
     const resolved = path.resolve(opts.repo ?? repoPath);
     // The MCP server speaks JSON-RPC over stdout, so any console.log() would
     // corrupt the protocol. runMcpServer logs everything via the stderr-only
     // logger and blocks until the parent disconnects.
-    await runMcpServer(resolved);
+    await runMcpServer(resolved, { readonly: !!opts.readonly });
   });
 
 // ── analyze ──

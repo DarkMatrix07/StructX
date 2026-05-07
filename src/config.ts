@@ -24,6 +24,14 @@ const ANTHROPIC_DEFAULTS = {
   answerModel: 'claude-sonnet-4-5-20250929',
 };
 
+const GEMINI_DEFAULTS = {
+  // Cheap-fast pick for batch analysis and fast-path classification, smarter
+  // model for the answerer where reasoning matters most.
+  analysisModel: 'gemini-2.0-flash',
+  classifierModel: 'gemini-2.0-flash',
+  answerModel: 'gemini-2.5-pro-preview-06-05',
+};
+
 const OPENROUTER_DEFAULTS = {
   // Sensible cheap-but-capable picks. Users can override per-project in config.json.
   analysisModel: 'anthropic/claude-haiku-4.5',
@@ -55,17 +63,19 @@ export function loadConfig(structxDir: string): StructXConfig {
 
   const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
 
-  // Provider precedence: explicit config > env-var hint (OPENROUTER_API_KEY) > anthropic default.
-  // The key likewise falls back across env vars so existing setups keep working.
-  const provider: LlmProvider = raw.provider
-    ?? (process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY ? 'openrouter' : 'anthropic');
+  // Provider precedence: explicit config > whichever env var is set.
+  // Detection priority when multiple env keys are present matches the README:
+  // Anthropic > Gemini > OpenRouter.
+  const provider: LlmProvider = raw.provider ?? detectProviderFromEnv();
 
-  const envKey = provider === 'openrouter'
-    ? (process.env.OPENROUTER_API_KEY || process.env.ANTHROPIC_API_KEY || '')
-    : (process.env.ANTHROPIC_API_KEY || '');
+  const envKey = pickApiKeyForProvider(provider);
   const apiKey = raw.anthropicApiKey || envKey;
 
-  const providerDefaults = provider === 'openrouter' ? OPENROUTER_DEFAULTS : ANTHROPIC_DEFAULTS;
+  const providerDefaults = provider === 'openrouter'
+    ? OPENROUTER_DEFAULTS
+    : provider === 'gemini'
+      ? GEMINI_DEFAULTS
+      : ANTHROPIC_DEFAULTS;
   const repoPath = resolveConfiguredRepoPath(raw.repoPath, structxDir);
 
   return {
@@ -80,6 +90,27 @@ export function loadConfig(structxDir: string): StructXConfig {
     anthropicApiKey: apiKey,
     structxDir,
   };
+}
+
+function detectProviderFromEnv(): LlmProvider {
+  if (process.env.ANTHROPIC_API_KEY) return 'anthropic';
+  if (process.env.GEMINI_API_KEY) return 'gemini';
+  if (process.env.OPENROUTER_API_KEY) return 'openrouter';
+  return 'anthropic';
+}
+
+function pickApiKeyForProvider(provider: LlmProvider): string {
+  if (provider === 'gemini') {
+    return process.env.GEMINI_API_KEY
+      || process.env.GOOGLE_API_KEY
+      || '';
+  }
+  if (provider === 'openrouter') {
+    return process.env.OPENROUTER_API_KEY
+      || process.env.ANTHROPIC_API_KEY
+      || '';
+  }
+  return process.env.ANTHROPIC_API_KEY || '';
 }
 
 function normalizeAnswerMaxTokens(value: unknown): number {

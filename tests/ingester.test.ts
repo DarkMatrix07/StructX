@@ -29,7 +29,9 @@ afterEach(() => {
 });
 
 describe('ingester semantic preservation', () => {
-  it('keeps semantic fields for unchanged functions when another function in the file changes', () => {
+  // ts-morph parses two source files end-to-end here — on Windows under load
+  // (parallel test workers) this can exceed the 5s default. Give it room.
+  it('keeps semantic fields for unchanged functions when another function in the file changes', { timeout: 20000 }, () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const repo = mkdtempSync(join(tmpdir(), 'structx-ingest-test-'));
     cleanup.push(repo);

@@ -8,11 +8,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { initializeDatabase } from '../src/db/connection';
 import { getAllFiles } from '../src/db/queries';
 import { ingestDirectory } from '../src/ingest/ingester';
-import { closeAllDbs } from '../src/mcp/db-pool';
+import { closeAllDbs, setReadonly } from '../src/mcp/db-pool';
 import { registerTools } from '../src/mcp/tools';
 import { getGraphFingerprint, makeAskCacheKey } from '../src/query/ask-cache';
 import { directLookup, impactAnalysis, listQuery, patternQuery, relationshipQuery, typeQuery } from '../src/query/retriever';
 import { insertQaRun, insertRoute, insertType, upsertFile } from '../src/db/queries';
+import { watchDirectory } from '../src/watch/watcher';
+import { openDatabase } from '../src/db/connection';
 
 const cleanup: string[] = [];
 
@@ -77,6 +79,18 @@ function createIndexedRepo(): { repo: string; dbPath: string } {
   return { repo, dbPath };
 }
 
+// Poll a condition until it returns truthy or the deadline passes. Used by
+// tests that need to wait on async filesystem-driven side effects (the
+// watcher's debounced flush) without sleeping for a fixed duration.
+async function waitForCondition(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return true;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}
+
 async function createMcpClient(repo: string): Promise<{ client: Client; server: McpServer }> {
   const server = new McpServer({ name: 'structx-test', version: '0.0.0' });
   registerTools(server, repo);
@@ -90,6 +104,7 @@ async function createMcpClient(repo: string): Promise<{ client: Client; server: 
 
 afterEach(() => {
   vi.restoreAllMocks();
+  setReadonly(false);
   closeAllDbs();
   for (const repo of cleanup.splice(0)) {
     rmSync(repo, { recursive: true, force: true });
@@ -248,6 +263,7 @@ export function useSaveB(): string {
       const listed = await client.listTools();
       expect(listed.tools.map(t => t.name).sort()).toEqual([
         'structx_ask',
+        'structx_costs',
         'structx_file',
         'structx_function',
         'structx_impact',
@@ -334,6 +350,206 @@ export function useSaveB(): string {
     expect(afterHash).not.toBe(beforeHash);
     expect(afterKey).not.toBe(beforeKey);
     expect(lowBudgetKey).not.toBe(highBudgetKey);
+  });
+
+  it('disables structx_ask in readonly mode but still serves graph queries', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const { repo } = createIndexedRepo();
+    setReadonly(true);
+    const { client, server } = await createMcpClient(repo);
+    try {
+      // Graph tool still works in readonly mode.
+      const fnCall = await client.callTool({
+        name: 'structx_function',
+        arguments: { name: 'calculateInvoice', response_mode: 'structured' },
+      });
+      expect((fnCall.structuredContent as any).functions[0].name).toBe('calculateInvoice');
+
+      // ask is rejected with a clear isError + structured reason.
+      const askCall = await client.callTool({
+        name: 'structx_ask',
+        arguments: { question: 'what does calculateInvoice do?' },
+      });
+      expect(askCall.isError).toBe(true);
+      expect((askCall.structuredContent as any).disabled).toBe(true);
+      expect((askCall.structuredContent as any).reason).toBe('readonly');
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('reports cost telemetry rolled up from qa_runs and ask_cache', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const { repo, dbPath } = createIndexedRepo();
+    const db = initializeDatabase(dbPath);
+    // Two paid runs (one CLI, one MCP) and one cached run — verifies the
+    // cache-hit ratio math and the by-mode roll-up.
+    insertQaRun(db, {
+      mode: 'structx',
+      question: 'first cli question',
+      input_tokens: 100, output_tokens: 50, total_tokens: 150,
+      cost_usd: 0.001, response_time_ms: 800,
+      files_accessed: null, functions_retrieved: 2, graph_query_time_ms: 5,
+      answer_text: 'cli answer',
+    });
+    insertQaRun(db, {
+      mode: 'structx-mcp',
+      question: 'first mcp question',
+      input_tokens: 200, output_tokens: 100, total_tokens: 300,
+      cost_usd: 0.003, response_time_ms: 1200,
+      files_accessed: null, functions_retrieved: 3, graph_query_time_ms: 8,
+      answer_text: 'mcp answer',
+    });
+    db.close();
+
+    const { client, server } = await createMcpClient(repo);
+    try {
+      const resp = await client.callTool({
+        name: 'structx_costs',
+        arguments: { response_mode: 'structured' },
+      });
+      const stats = resp.structuredContent as any;
+      expect(stats.totalRuns).toBe(2);
+      expect(stats.totalCostUsd).toBeCloseTo(0.004, 6);
+      expect(stats.totalInputTokens).toBe(300);
+      expect(stats.totalOutputTokens).toBe(150);
+      const modes = stats.byMode.map((m: any) => m.mode).sort();
+      expect(modes).toEqual(['structx', 'structx-mcp']);
+      const cliMode = stats.byMode.find((m: any) => m.mode === 'structx');
+      expect(cliMode.runs).toBe(1);
+      expect(cliMode.totalCostUsd).toBeCloseTo(0.001, 6);
+      expect(cliMode.p50ResponseTimeMs).toBe(800);
+      // recent runs come back newest-first
+      expect(stats.recentRuns[0].question).toBe('first mcp question');
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('honors the structx_search scope filter to drop unwanted entity kinds', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const { repo } = createIndexedRepo();
+    const { client, server } = await createMcpClient(repo);
+    try {
+      // Default (no scope) in broad mode: file matches always populate even
+      // without semantic analysis (FTS over file paths). Use that as a stable
+      // check that the unscoped path returns at least one kind.
+      const broadResp = await client.callTool({
+        name: 'structx_search',
+        arguments: { keywords: ['mcp', 'tools'], mode: 'broad', response_mode: 'structured' },
+      });
+      const broadStruct = broadResp.structuredContent as any;
+      expect(broadStruct.files.length).toBeGreaterThan(0);
+
+      // scope: ['types'] drops files (and everything else); the type fixture
+      // BillingSearchOptions matches semantic search for 'billing'.
+      const typesOnly = await client.callTool({
+        name: 'structx_search',
+        arguments: { keywords: ['BillingSearchOptions'], scope: ['types'], response_mode: 'structured' },
+      });
+      const typesStruct = typesOnly.structuredContent as any;
+      expect(typesStruct.functions).toEqual([]);
+      expect(typesStruct.routes).toEqual([]);
+      expect(typesStruct.files).toEqual([]);
+      expect(typesStruct.constants).toEqual([]);
+
+      // scope=['functions'] on the same broad query strips the files we just
+      // saw, even though the underlying retrieval populated them.
+      const fnsOnly = await client.callTool({
+        name: 'structx_search',
+        arguments: { keywords: ['mcp', 'tools'], mode: 'broad', scope: ['functions'], response_mode: 'structured' },
+      });
+      const fnsStruct = fnsOnly.structuredContent as any;
+      expect(fnsStruct.types).toEqual([]);
+      expect(fnsStruct.routes).toEqual([]);
+      expect(fnsStruct.files).toEqual([]);
+      expect(fnsStruct.constants).toEqual([]);
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('routes tool calls to the right repo when given an explicit repo_path', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Two indexed repos sharing one MCP server — calls without repo_path
+    // should target repo A (the server default), calls with repo_path: B
+    // should target repo B, and the two graphs must not bleed into each
+    // other. This covers the multi-repo workflow documented in the README.
+    const repoA = mkdtempSync(join(tmpdir(), 'structx-multirepo-a-'));
+    const repoB = mkdtempSync(join(tmpdir(), 'structx-multirepo-b-'));
+    cleanup.push(repoA, repoB);
+    mkdirSync(join(repoA, 'src'), { recursive: true });
+    mkdirSync(join(repoB, 'src'), { recursive: true });
+    writeFileSync(join(repoA, 'src', 'a.ts'), 'export function repoAFn(): number { return 1; }\n');
+    writeFileSync(join(repoB, 'src', 'b.ts'), 'export function repoBFn(): string { return "two"; }\n');
+    const dbA = initializeDatabase(join(repoA, '.structx', 'db.sqlite'));
+    ingestDirectory(dbA, repoA, 0.2);
+    dbA.close();
+    const dbB = initializeDatabase(join(repoB, '.structx', 'db.sqlite'));
+    ingestDirectory(dbB, repoB, 0.2);
+    dbB.close();
+
+    const { client, server } = await createMcpClient(repoA);
+    try {
+      const defaultCall = await client.callTool({
+        name: 'structx_function',
+        arguments: { name: 'repoAFn', response_mode: 'structured' },
+      });
+      expect((defaultCall.structuredContent as any).functions.map((fn: any) => fn.name)).toEqual(['repoAFn']);
+
+      const overrideCall = await client.callTool({
+        name: 'structx_function',
+        arguments: { name: 'repoBFn', repo_path: repoB, response_mode: 'structured' },
+      });
+      expect((overrideCall.structuredContent as any).functions.map((fn: any) => fn.name)).toEqual(['repoBFn']);
+
+      // Cross-check: looking up repo B's function with no repo_path must miss
+      // because the server default is repo A.
+      const crossMiss = await client.callTool({
+        name: 'structx_function',
+        arguments: { name: 'repoBFn', response_mode: 'structured' },
+      });
+      expect((crossMiss.structuredContent as any).functions).toEqual([]);
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('serves graph updates from a concurrent structx watch process', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // The MCP server's pooled DB connection and the watcher's connection both
+    // talk to the same SQLite file. WAL mode means watcher commits are visible
+    // to the MCP reader on the next query — verify that round-trip end-to-end.
+    const { repo, dbPath } = createIndexedRepo();
+    const watchDb = openDatabase(dbPath);
+    const stop = await watchDirectory(watchDb, repo, { diffThreshold: 0.2, quietMs: 30, maxHoldMs: 200 });
+    const { client, server } = await createMcpClient(repo);
+    try {
+      // Drop in a brand-new file after the server is running.
+      writeFileSync(join(repo, 'src', 'features', 'live-update.ts'), `
+export function liveUpdateProbe(): string {
+  return 'visible to mcp';
+}
+`);
+
+      const found = await waitForCondition(async () => {
+        const resp = await client.callTool({
+          name: 'structx_function',
+          arguments: { name: 'liveUpdateProbe', response_mode: 'structured' },
+        });
+        return (resp.structuredContent as any).functions.length > 0;
+      }, 5000);
+      expect(found).toBe(true);
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+      await stop();
+      try { watchDb.close(); } catch {}
+    }
   });
 
   it('keeps graph fingerprints stable when only QA run history changes', () => {

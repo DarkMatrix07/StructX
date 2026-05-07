@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { classifyQuestion, classifyQuestionFastPath } from '../src/query/classifier';
-import type { LLMProvider } from '../src/providers/interface';
+import type { LlmClientConfig } from '../src/utils/llm';
 
-const failingProvider: LLMProvider = {
-  async chat() {
-    throw new Error('LLM classifier should not be called for fast-path questions');
-  },
+// Sentinel config — fast-path tests should never reach the LLM, so the fact
+// that this config has a non-existent base URL is a stronger guarantee than
+// a stub provider would be. If the unified client ever does reach out, the
+// connection will fail and the test will fail loudly.
+const sentinelLlmConfig: LlmClientConfig = {
+  provider: 'anthropic',
+  apiKey: 'no-llm-call-expected',
+  baseURL: 'http://127.0.0.1:1',
 };
 
 describe('classifier fast path', () => {
   it('routes direct function explanation without an LLM call', async () => {
-    const result = await classifyQuestion('what does login do, and what does it call?', 'model', failingProvider);
+    const result = await classifyQuestion('what does login do, and what does it call?', 'model', sentinelLlmConfig);
 
     expect(result.strategy).toBe('direct');
     expect(result.functionName).toBe('login');

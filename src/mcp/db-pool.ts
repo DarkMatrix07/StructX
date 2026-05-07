@@ -9,6 +9,18 @@ import { getStructXDir } from '../config';
 // concurrency with a parallel `structx watch` writing to the same file.
 const pool = new Map<string, Database.Database>();
 
+// When true, all subsequent getDb() calls open the connection with
+// readonly: true. Set once at server startup via setReadonly().
+let readonlyMode = false;
+
+export function setReadonly(readonly: boolean): void {
+  readonlyMode = readonly;
+}
+
+export function isReadonly(): boolean {
+  return readonlyMode;
+}
+
 export class StructxNotInitializedError extends Error {
   constructor(public repoPath: string) {
     super(`StructX not initialized for ${repoPath}. Run 'structx setup ${repoPath}' first.`);
@@ -37,7 +49,7 @@ export function getDb(repoPath: string): Database.Database {
   if (!fs.existsSync(dbPath)) {
     throw new StructxNotInitializedError(abs);
   }
-  const db = openDatabase(dbPath);
+  const db = openDatabase(dbPath, { readonly: readonlyMode });
   pool.set(abs, db);
   return db;
 }

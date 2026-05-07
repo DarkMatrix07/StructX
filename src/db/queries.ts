@@ -384,6 +384,111 @@ export function getQaRuns(db: Database.Database, mode?: string): QaRunRow[] {
   return db.prepare('SELECT * FROM qa_runs ORDER BY created_at DESC').all() as QaRunRow[];
 }
 
+// ── Cost telemetry ──
+
+export interface CostStatsByMode {
+  mode: string;
+  runs: number;
+  totalCostUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  avgResponseTimeMs: number;
+  p50ResponseTimeMs: number;
+  p95ResponseTimeMs: number;
+}
+
+export interface CostStats {
+  totalRuns: number;
+  totalCostUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  byMode: CostStatsByMode[];
+  // Cache hit ratio: ask_cache rows / total ask invocations.
+  // We approximate "total ask invocations" as cache rows + non-cached qa_runs
+  // because every non-cached call writes one of each.
+  cacheHits: number;
+  cacheHitRatio: number;
+  // Most recent runs for context.
+  recentRuns: Array<Pick<QaRunRow, 'mode' | 'question' | 'cost_usd' | 'total_tokens' | 'response_time_ms' | 'created_at'>>;
+}
+
+// Roll up cost telemetry from qa_runs and ask_cache. Pure read; no LLM calls.
+// Used by the structx_costs MCP tool and any equivalent CLI surface we add
+// later. Quantiles use SQLite's NTILE so we don't load every row into JS.
+export function getCostStats(db: Database.Database, recentLimit: number = 10): CostStats {
+  const totals = db.prepare(`
+    SELECT
+      COUNT(*) as runs,
+      COALESCE(SUM(cost_usd), 0) as cost,
+      COALESCE(SUM(input_tokens), 0) as inTok,
+      COALESCE(SUM(output_tokens), 0) as outTok
+    FROM qa_runs
+  `).get() as { runs: number; cost: number; inTok: number; outTok: number };
+
+  const modes = db.prepare(`
+    SELECT mode, COUNT(*) as runs,
+           COALESCE(SUM(cost_usd), 0) as cost,
+           COALESCE(SUM(input_tokens), 0) as inTok,
+           COALESCE(SUM(output_tokens), 0) as outTok,
+           COALESCE(AVG(response_time_ms), 0) as avgMs
+    FROM qa_runs
+    GROUP BY mode
+    ORDER BY cost DESC
+  `).all() as Array<{ mode: string; runs: number; cost: number; inTok: number; outTok: number; avgMs: number }>;
+
+  const byMode: CostStatsByMode[] = modes.map(m => {
+    const times = db.prepare(`
+      SELECT response_time_ms FROM qa_runs WHERE mode = ? AND response_time_ms IS NOT NULL
+      ORDER BY response_time_ms ASC
+    `).all(m.mode) as Array<{ response_time_ms: number }>;
+    return {
+      mode: m.mode,
+      runs: m.runs,
+      totalCostUsd: m.cost,
+      totalInputTokens: m.inTok,
+      totalOutputTokens: m.outTok,
+      avgResponseTimeMs: m.avgMs,
+      p50ResponseTimeMs: percentile(times.map(t => t.response_time_ms), 0.5),
+      p95ResponseTimeMs: percentile(times.map(t => t.response_time_ms), 0.95),
+    };
+  });
+
+  let cacheHits = 0;
+  try {
+    cacheHits = (db.prepare('SELECT COUNT(*) as count FROM ask_cache').get() as { count: number }).count;
+  } catch { /* table may not exist on very old DBs */ }
+  const cacheHitRatio = (cacheHits + totals.runs) > 0
+    ? cacheHits / (cacheHits + totals.runs)
+    : 0;
+
+  const recentRuns = db.prepare(`
+    SELECT mode, question, cost_usd, total_tokens, response_time_ms, created_at
+    FROM qa_runs ORDER BY created_at DESC, id DESC LIMIT ?
+  `).all(recentLimit) as Array<Pick<QaRunRow, 'mode' | 'question' | 'cost_usd' | 'total_tokens' | 'response_time_ms' | 'created_at'>>;
+
+  return {
+    totalRuns: totals.runs,
+    totalCostUsd: totals.cost,
+    totalInputTokens: totals.inTok,
+    totalOutputTokens: totals.outTok,
+    byMode,
+    cacheHits,
+    cacheHitRatio,
+    recentRuns,
+  };
+}
+
+function percentile(sortedAsc: number[], pct: number): number {
+  if (sortedAsc.length === 0) return 0;
+  // Linear-interp percentile, same algorithm as numpy default.
+  const idx = (sortedAsc.length - 1) * pct;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sortedAsc[lo];
+  const frac = idx - lo;
+  return sortedAsc[lo] * (1 - frac) + sortedAsc[hi] * frac;
+}
+
 // ── FTS queries ──
 
 export function searchFunctions(db: Database.Database, query: string, limit: number = 10): FunctionRow[] {

@@ -8,14 +8,14 @@ import {
 import {
   getStats, getFullOverview,
   getCachedAskResponse, insertCachedAskResponse, insertQaRun,
-  getFunctionsByName,
+  getFunctionsByName, getCostStats,
 } from '../db/queries';
 import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
 import { generateAnswer } from '../query/answerer';
 import { getGraphFingerprint, makeAskCacheKey } from '../query/ask-cache';
 import { loadConfig, getStructXDir, getLlmConfig } from '../config';
-import { getDb, resolveRepoPath, StructxNotInitializedError } from './db-pool';
+import { getDb, resolveRepoPath, StructxNotInitializedError, isReadonly } from './db-pool';
 import { formatContext, formatFunction, formatType, formatRoute, formatFile } from './format';
 
 // All tool args may include a repo_path that overrides the server's default.
@@ -27,6 +27,8 @@ const AskMaxTokens = z.number().int().min(64).max(8192).optional().describe('Max
 const SearchArgs = z.object({
   keywords: z.array(z.string()).min(1).describe('Search terms (e.g. ["auth", "login"]). FTS-sanitized internally.'),
   mode: z.enum(['narrow', 'broad']).optional().describe('narrow = fewer high-precision results (default); broad = wider net for cross-cutting concerns.'),
+  scope: z.array(z.enum(['functions', 'types', 'routes', 'files', 'constants'])).optional()
+    .describe('Restrict results to one or more entity kinds. Omit to search all kinds. Useful when the agent only wants e.g. functions and saving context tokens on the rest.'),
   limit: Limit,
   detail: Detail,
   response_mode: ResponseMode,
@@ -92,6 +94,11 @@ const OverviewArgs = z.object({
 const AskArgs = z.object({
   question: z.string().describe('Natural language question (e.g. "How is authentication handled?").'),
   max_tokens: AskMaxTokens,
+  repo_path: RepoPath,
+}).strict();
+const CostsArgs = z.object({
+  recent_limit: z.number().int().min(1).max(100).optional().describe('Number of most-recent runs to include in the response. Defaults to 10.'),
+  response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
 
@@ -203,6 +210,28 @@ function textOnlyStructuredSummary(structuredContent: any): any {
     omitted: true,
     reason: 'response_mode=text',
     counts: countStructuredContent(structuredContent),
+  };
+}
+
+// Truncate long strings for display in cost tables and other compact lists.
+function truncate(s: string | null | undefined, max: number): string {
+  if (!s) return '';
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+
+// Drop entity kinds that the caller didn't ask for. Keeps the response shape
+// stable (every kind still present as an array) so downstream code that
+// counts by kind doesn't have to special-case missing fields.
+function applyScope(ctx: any, scope?: Array<'functions' | 'types' | 'routes' | 'files' | 'constants'>): any {
+  if (!scope || scope.length === 0) return ctx;
+  const keep = new Set(scope);
+  return {
+    ...ctx,
+    functions: keep.has('functions') ? ctx.functions : [],
+    types: keep.has('types') ? ctx.types : [],
+    routes: keep.has('routes') ? ctx.routes : [],
+    files: keep.has('files') ? ctx.files : [],
+    constants: keep.has('constants') ? ctx.constants : [],
   };
 }
 
@@ -334,14 +363,20 @@ function compactOverview(overview: ReturnType<typeof getFullOverview>, maxItems:
 }
 
 export function registerTools(server: McpServer, defaultRepo: string): void {
+  // Readonly mode is set on the db-pool before registerTools() is called by
+  // the server entry point. We capture it here so individual tool handlers
+  // don't have to re-check on every call.
+  const readonly = isReadonly();
   // ── 1. structx_search ──────────────────────────────────────────────────
   server.registerTool('structx_search', {
     description: 'Search the code graph by keywords. Returns matching functions, types, routes, and constants. Pure graph query — no LLM cost.',
     inputSchema: SearchArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
-    const ctx = limitContext(args.mode === 'broad'
+    const baseCtx = args.mode === 'broad'
       ? patternQuery(db, args.keywords)
-      : semanticSearch(db, args.keywords), args.limit);
+      : semanticSearch(db, args.keywords);
+    const scoped = applyScope(baseCtx, args.scope);
+    const ctx = limitContext(scoped, args.limit);
     const text = formatContext(ctx, `Search results for: ${args.keywords.join(', ')}`);
     return toolResponse(text, structuredContext(ctx, args.detail), args.response_mode);
   }));
@@ -484,11 +519,55 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     return toolResponse(lines.join('\n'), structured, args.response_mode);
   }));
 
-  // ── 10. structx_ask ────────────────────────────────────────────────────
+  // ── 10. structx_costs ──────────────────────────────────────────────────
+  server.registerTool('structx_costs', {
+    description: 'Cost telemetry for this repo: total spend, tokens, latency percentiles by mode, ask-cache hit ratio, and recent runs. Pure read — no LLM cost.',
+    inputSchema: CostsArgs,
+  }, async (args: any) => withDb(defaultRepo, args.repo_path, (db, repo) => {
+    const stats = getCostStats(db, args.recent_limit ?? 10);
+    const lines = [
+      `# Cost telemetry for ${repo}`,
+      '',
+      `- **Total runs:** ${stats.totalRuns}`,
+      `- **Total spend:** $${stats.totalCostUsd.toFixed(4)}`,
+      `- **Tokens:** ${stats.totalInputTokens.toLocaleString()} in / ${stats.totalOutputTokens.toLocaleString()} out`,
+      `- **Cached responses:** ${stats.cacheHits} (hit ratio ${(stats.cacheHitRatio * 100).toFixed(1)}%)`,
+    ];
+    if (stats.byMode.length > 0) {
+      lines.push('', '## By mode');
+      for (const m of stats.byMode) {
+        lines.push(
+          `- **${m.mode}:** ${m.runs} runs, $${m.totalCostUsd.toFixed(4)}, p50 ${m.p50ResponseTimeMs.toFixed(0)}ms / p95 ${m.p95ResponseTimeMs.toFixed(0)}ms`,
+        );
+      }
+    }
+    if (stats.recentRuns.length > 0) {
+      lines.push('', '## Recent');
+      for (const r of stats.recentRuns) {
+        const cost = r.cost_usd != null ? `$${r.cost_usd.toFixed(4)}` : 'cached';
+        const tokens = r.total_tokens ?? 0;
+        const ms = r.response_time_ms != null ? `${r.response_time_ms}ms` : '—';
+        lines.push(`- [${r.mode}] ${cost} · ${tokens} tok · ${ms} · ${truncate(r.question, 60)}`);
+      }
+    }
+    return toolResponse(lines.join('\n'), stats, args.response_mode);
+  }));
+
+  // ── 11. structx_ask ────────────────────────────────────────────────────
   server.registerTool('structx_ask', {
-    description: 'Full natural-language Q&A over the code graph. Costs LLM tokens. Honors the SHA256-keyed ask cache so identical questions are instant.',
+    description: readonly
+      ? 'DISABLED in readonly mode. structx_ask writes to ask_cache and qa_runs. Restart the server without --readonly to enable.'
+      : 'Full natural-language Q&A over the code graph. Costs LLM tokens. Honors the SHA256-keyed ask cache so identical questions are instant.',
     inputSchema: AskArgs,
-  }, async (args: any) => withDbAsync(defaultRepo, args.repo_path, async (db, repo) => {
+  }, async (args: any) => {
+    if (readonly) {
+      return {
+        content: [{ type: 'text' as const, text: 'structx_ask is disabled in readonly mode (server started with --readonly). Use the pure-graph tools (structx_search, structx_function, etc.) or restart the server without --readonly.' }],
+        structuredContent: { disabled: true, reason: 'readonly' },
+        isError: true,
+      };
+    }
+    return withDbAsync(defaultRepo, args.repo_path, async (db, repo) => {
     const config = loadConfig(getStructXDir(repo));
     const answerMaxTokens = args.max_tokens ?? config.answerMaxTokens;
 
@@ -595,5 +674,6 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
         graphHash,
       },
     };
-  }));
+    });
+  });
 }

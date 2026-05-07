@@ -79,7 +79,7 @@ StructX can run as a Model Context Protocol server over stdio, so MCP-aware edit
 structx mcp --repo /abs/path/to/your/repo
 ```
 
-Example Claude Desktop configuration:
+Example **Claude Desktop** configuration (`claude_desktop_config.json`):
 
 ```json
 {
@@ -92,9 +92,44 @@ Example Claude Desktop configuration:
 }
 ```
 
-The server exposes these tools: `structx_search`, `structx_function`, `structx_relationships`, `structx_impact`, `structx_route`, `structx_type`, `structx_file`, `structx_list`, `structx_overview`, and `structx_ask`. Each tool accepts an optional `repo_path` argument to override the server default for that call. `structx_ask` is the only LLM-backed tool; the other tools query the local SQLite graph directly.
+**Cursor** — add to `~/.cursor/mcp.json` (or via Settings → MCP):
 
-Most graph tools also accept `limit`, `detail`, and `response_mode` controls. `detail: "summary"` is the default and returns compact `structuredContent`; `detail: "full"` returns all retrieved fields. `response_mode: "both"` is the default, `response_mode: "structured"` returns a short text stub plus full structured data, and `response_mode: "text"` keeps markdown while replacing structured data with counts. `structx_function` omits the function body by default; pass `include_body: true` when the assistant needs exact source for a target function.
+```json
+{
+  "mcpServers": {
+    "structx": {
+      "command": "structx",
+      "args": ["mcp", "--repo", "/abs/path/to/your/repo"]
+    }
+  }
+}
+```
+
+**Continue** — add to `~/.continue/config.yaml`:
+
+```yaml
+mcpServers:
+  - name: structx
+    command: structx
+    args:
+      - mcp
+      - --repo
+      - /abs/path/to/your/repo
+```
+
+**Cline / Roo** — same shape as Claude Desktop, in the extension's MCP settings.
+
+For shared/protected repos where the MCP server should never write to the graph, add `--readonly`:
+
+```json
+"args": ["mcp", "--repo", "/path", "--readonly"]
+```
+
+This opens the SQLite DB read-only and disables `structx_ask` (which writes to `ask_cache` and `qa_runs`); all other tools work normally.
+
+The server exposes these tools: `structx_search`, `structx_function`, `structx_relationships`, `structx_impact`, `structx_route`, `structx_type`, `structx_file`, `structx_list`, `structx_overview`, `structx_costs`, and `structx_ask`. Each tool accepts an optional `repo_path` argument to override the server default for that call. `structx_ask` is the only LLM-backed tool; the others query the local SQLite graph directly. `structx_costs` rolls up spend, latency percentiles, and cache-hit ratio from past runs.
+
+Most graph tools also accept `limit`, `detail`, and `response_mode` controls. `structx_search` additionally accepts `scope: ["functions"]` (or any combination of `functions`, `types`, `routes`, `files`, `constants`) so the agent can request only the entity kinds it cares about. `detail: "summary"` is the default and returns compact `structuredContent`; `detail: "full"` returns all retrieved fields. `response_mode: "both"` is the default, `response_mode: "structured"` returns a short text stub plus full structured data, and `response_mode: "text"` keeps markdown while replacing structured data with counts. `structx_function` omits the function body by default; pass `include_body: true` when the assistant needs exact source for a target function.
 
 `structx_route` also accepts `path_match: "exact"` when an assistant needs `/api/tasks` without substring matches like `/api/tasks/:id/archive`.
 

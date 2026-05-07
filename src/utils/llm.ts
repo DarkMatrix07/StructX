@@ -1,13 +1,15 @@
-// Unified LLM client. StructX talks to Anthropic directly or to any
-// OpenAI-compatible endpoint (OpenRouter, Together, local servers) through a
-// single `complete()` interface. All model-specific tuning (max_tokens,
-// max_output_tokens, temperature defaults) lives behind this boundary so the
-// analyzer/classifier/answerer don't need to know the provider.
+// Unified LLM client. StructX talks to Anthropic directly, Google Gemini
+// directly, or any OpenAI-compatible endpoint (OpenRouter, Together, local
+// servers) through a single `complete()` interface. All model-specific
+// tuning (max_tokens, temperature defaults, system-message placement) lives
+// behind this boundary so the analyzer/classifier/answerer don't need to
+// know the provider.
 
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-export type LlmProvider = 'anthropic' | 'openrouter';
+export type LlmProvider = 'anthropic' | 'gemini' | 'openrouter';
 
 export interface LlmClientConfig {
   provider: LlmProvider;
@@ -39,6 +41,9 @@ export interface LlmClient {
 export function createLlmClient(cfg: LlmClientConfig): LlmClient {
   if (cfg.provider === 'openrouter') {
     return new OpenRouterClient(cfg);
+  }
+  if (cfg.provider === 'gemini') {
+    return new GeminiClient(cfg);
   }
   return new AnthropicClient(cfg);
 }
@@ -116,6 +121,48 @@ class OpenRouterClient implements LlmClient {
       text,
       inputTokens: response.usage?.prompt_tokens ?? 0,
       outputTokens: response.usage?.completion_tokens ?? 0,
+    };
+  }
+}
+
+// Gemini lives behind a different SDK (REST + Google's wrapper) but the
+// shape we need is identical: send a system prompt + a user turn (and
+// optionally an assistant retry turn), get text + token counts back.
+class GeminiClient implements LlmClient {
+  provider: LlmProvider = 'gemini';
+  private genAI: GoogleGenerativeAI;
+
+  constructor(cfg: LlmClientConfig) {
+    this.genAI = new GoogleGenerativeAI(cfg.apiKey);
+  }
+
+  async complete(req: LlmCompleteRequest): Promise<LlmCompleteResponse> {
+    const model = this.genAI.getGenerativeModel({
+      model: req.model,
+      ...(req.system ? { systemInstruction: req.system } : {}),
+      generationConfig: {
+        maxOutputTokens: req.maxTokens,
+      },
+    });
+
+    // Gemini uses 'model' instead of 'assistant' for prior turns.
+    const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [
+      { role: 'user', parts: [{ text: req.prompt }] },
+    ];
+    if (req.assistantPriorTurn && req.retryUserMessage) {
+      contents.push({ role: 'model', parts: [{ text: req.assistantPriorTurn }] });
+      contents.push({ role: 'user', parts: [{ text: req.retryUserMessage }] });
+    }
+
+    const result = await model.generateContent({ contents });
+    const response = result.response;
+    const text = response.text();
+    const usage = response.usageMetadata;
+
+    return {
+      text,
+      inputTokens: usage?.promptTokenCount ?? 0,
+      outputTokens: usage?.candidatesTokenCount ?? 0,
     };
   }
 }
