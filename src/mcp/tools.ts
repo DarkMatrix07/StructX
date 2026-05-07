@@ -1,7 +1,7 @@
 import { z } from 'zod/v3';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
-  directLookup, relationshipQuery, semanticSearch, patternQuery,
+  directLookup, directLookupExpanded, relationshipQuery, semanticSearch, patternQuery,
   impactAnalysis, routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery,
   domainQuery,
 } from '../query/retriever';
@@ -616,7 +616,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     const graphQueryStart = Date.now();
     let retrieved;
     switch (classification.strategy) {
-      case 'direct': retrieved = directLookup(db, classification.functionName || ''); break;
+      case 'direct': retrieved = directLookupExpanded(db, classification.functionName || ''); break;
       case 'relationship': retrieved = relationshipQuery(db, classification.functionName || '', classification.direction || 'callers'); break;
       case 'semantic': retrieved = semanticSearch(db, classification.keywords); break;
       case 'domain': retrieved = domainQuery(db, classification.domain || 'other'); break;

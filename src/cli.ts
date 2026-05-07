@@ -12,7 +12,7 @@ import { analyzeBatch, rebuildSearchIndex, analyzeTypes, analyzeRoutes, analyzeF
 import { estimateAnalysisCost, formatCostEstimate } from './semantic/cost';
 import { getPendingAnalysis, getPendingAnalysisCount, enqueueUnanalyzedFunctions, insertQaRun, getCachedAskResponse, insertCachedAskResponse } from './db/queries';
 import { classifyQuestionWithUsage } from './query/classifier';
-import { directLookup, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
+import { directLookup, directLookupExpanded, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
 import { buildContext } from './query/context-builder';
 import { generateAnswer } from './query/answerer';
 import { getGraphFingerprint, makeAskCacheKey } from './query/ask-cache';
@@ -800,7 +800,7 @@ program
 
     switch (classification.strategy) {
       case 'direct':
-        retrieved = directLookup(db, classification.functionName || '');
+        retrieved = directLookupExpanded(db, classification.functionName || '');
         break;
       case 'relationship':
         retrieved = relationshipQuery(

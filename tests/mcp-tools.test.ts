@@ -11,7 +11,7 @@ import { ingestDirectory } from '../src/ingest/ingester';
 import { closeAllDbs, setReadonly } from '../src/mcp/db-pool';
 import { registerTools } from '../src/mcp/tools';
 import { getGraphFingerprint, makeAskCacheKey } from '../src/query/ask-cache';
-import { directLookup, impactAnalysis, listQuery, patternQuery, relationshipQuery, typeQuery } from '../src/query/retriever';
+import { directLookup, directLookupExpanded, impactAnalysis, listQuery, patternQuery, relationshipQuery, typeQuery } from '../src/query/retriever';
 import { insertQaRun, insertRoute, insertType, upsertFile } from '../src/db/queries';
 import { watchDirectory } from '../src/watch/watcher';
 import { openDatabase } from '../src/db/connection';
@@ -211,6 +211,103 @@ export function useSaveB(): string {
     ]);
     expect(callers.functions.map(fn => fn.name).sort()).toEqual(['useSaveA', 'useSaveB']);
     expect(impact.functions.map(fn => fn.name).sort()).toEqual(['useSaveA', 'useSaveB']);
+  });
+
+  it('directLookup pulls in the bodies of immediate callees for richer context', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Two-layer fixture: outer() → inner(). The agent asking "what does
+    // outer do?" needs to see inner()'s body to reason about the side
+    // effects, not just outer()'s shape.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-direct-callees-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'sample.ts'), `
+export function inner(x: number): number {
+  return x * 2 + 1;
+}
+
+export function outer(x: number): number {
+  return inner(x);
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    // directLookupExpanded is the answer-flow variant that includes callees;
+    // plain directLookup remains a focused single-function lookup.
+    const expanded = directLookupExpanded(db, 'outer');
+    const focused = directLookup(db, 'outer');
+    db.close();
+
+    // The expanded form includes target + callee, both with bodies.
+    const names = expanded.functions.map(fn => fn.name);
+    expect(names).toContain('outer');
+    expect(names).toContain('inner');
+    const outer = expanded.functions.find(fn => fn.name === 'outer')!;
+    const inner = expanded.functions.find(fn => fn.name === 'inner')!;
+    expect(outer.body).toMatch(/return inner\(x\)/);
+    expect(inner.body).toMatch(/return x \* 2 \+ 1/);
+
+    // Plain directLookup keeps the focused semantic — target only, no body
+    // unless the caller opts in. Preserves the MCP structx_function tool
+    // contract where include_body is the explicit opt-in.
+    expect(focused.functions.map(fn => fn.name)).toEqual(['outer']);
+    expect(focused.functions[0].body).toBeUndefined();
+  });
+
+  it('patternQuery includes function bodies when the result set is small', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-pattern-body-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    // Function NAMES match the FTS tokens directly — FTS5's default
+    // unicode61 tokenizer doesn't split camelCase, so we use names that
+    // tokenize cleanly (e.g. `authenticate` matches `authenticate`).
+    writeFileSync(join(repo, 'src', 'auth.ts'), `
+export function authenticate(token: string): boolean {
+  return token.startsWith('valid-');
+}
+
+export function authorize(role: string): boolean {
+  return role === 'admin';
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const ctx = patternQuery(db, ['authenticate', 'authorize']);
+    db.close();
+
+    expect(ctx.functions.length).toBeGreaterThan(0);
+    expect(ctx.functions.length).toBeLessThanOrEqual(8);
+    // At least one matched function carries its body — proves the body
+    // gating fired for this narrow result set.
+    expect(ctx.functions.some(fn => fn.body && fn.body.length > 0)).toBe(true);
+  });
+
+  it('patternQuery omits bodies when the result set is large to control token cost', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-pattern-nobody-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    // 12 functions each tokenizing to `pulse` + something — FTS5's default
+    // unicode61 tokenizer splits on underscore, so `pulse_alpha` matches
+    // `pulse`. With the threshold at 8 functions, none should carry bodies.
+    const words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta',
+      'eta', 'theta', 'iota', 'kappa', 'lambda', 'mu'];
+    const fns = words.map((w, i) =>
+      `export function pulse_${w}(): number { return ${i}; }`,
+    ).join('\n');
+    writeFileSync(join(repo, 'src', 'pulses.ts'), fns);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const ctx = patternQuery(db, ['pulse']);
+    db.close();
+
+    // With 12 matches the body gate stays closed.
+    expect(ctx.functions.length).toBeGreaterThan(8);
+    expect(ctx.functions.every(fn => !fn.body)).toBe(true);
   });
 
   it('honors function list limits above the old internal cap of 50', () => {

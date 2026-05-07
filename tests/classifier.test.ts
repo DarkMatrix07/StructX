@@ -56,4 +56,27 @@ describe('classifier fast path', () => {
     expect(result?.strategy).toBe('route');
     expect(result?.keywords).toEqual(['creates', 'tasks']);
   });
+
+  // Cross-cutting flow questions naturally mention "routes" or "endpoints"
+  // but want service bodies too — they should NOT be hijacked by the
+  // route-detection step, which would only return route definitions.
+  it('routes "walk through" flow questions to pattern even when they mention routes', () => {
+    const result = classifyQuestionFastPath('Walk me through the soft-delete flow for tasks. Which routes start it, where is the auth check?');
+
+    expect(result?.strategy).toBe('pattern');
+    expect(result?.keywords).toContain('soft-delete');
+  });
+
+  it('routes "end to end" flow questions to pattern even when they mention endpoints', () => {
+    const result = classifyQuestionFastPath('how does authentication work end to end across endpoints?');
+
+    expect(result?.strategy).toBe('pattern');
+    expect(result?.keywords).toContain('authentication');
+  });
+
+  it('routes "step by step" / "trace" questions to pattern', () => {
+    const result = classifyQuestionFastPath('trace the request lifecycle step-by-step');
+
+    expect(result?.strategy).toBe('pattern');
+  });
 });

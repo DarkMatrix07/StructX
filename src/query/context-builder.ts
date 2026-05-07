@@ -15,7 +15,16 @@ export function buildContext(retrieved: RetrievedContext, question: string): str
 
   switch (retrieved.strategy) {
     case 'direct':
-      if (retrieved.functions.length > 0) sections.push(formatDirectContext(retrieved.functions[0]));
+      // The first function is the lookup target; any remaining ones are its
+      // immediate callees pulled in to give the answerer enough context to
+      // reason about WHAT the target actually does (not just its signature).
+      if (retrieved.functions.length > 0) {
+        sections.push(formatDirectContext(retrieved.functions[0]));
+        if (retrieved.functions.length > 1) {
+          const callees = retrieved.functions.slice(1).map(formatCalleeContext).join('\n\n');
+          sections.push(`Direct callees:\n\n${callees}`);
+        }
+      }
       break;
     case 'relationship':
       sections.push(formatRelationshipContext(retrieved.functions));
@@ -98,8 +107,26 @@ function formatDirectContext(fn: RetrievedFunction): string {
   if (fn.complexity) lines.push(`Complexity: ${fn.complexity}`);
   if (fn.calls.length > 0) lines.push(`Calls: ${fn.calls.join(', ')}`);
   if (fn.calledBy.length > 0) lines.push(`Called By: ${fn.calledBy.join(', ')}`);
+  if (fn.body) lines.push(`Body:\n${fn.body}`);
 
   return lines.join('\n');
+}
+
+// Compact format for callees pulled alongside a directLookup target.
+// Single-line header + optional purpose + body — no signature noise since
+// the relationship is implicit from the parent target.
+function formatCalleeContext(fn: RetrievedFunction): string {
+  const lines = [
+    `- ${fn.name} @ ${fn.location}`,
+    `  Signature: ${fn.signature}`,
+  ];
+  if (fn.purpose) lines.push(`  Purpose: ${fn.purpose}`);
+  if (fn.body) lines.push(`  Body:\n${indent(fn.body, '    ')}`);
+  return lines.join('\n');
+}
+
+function indent(text: string, prefix: string): string {
+  return text.split('\n').map(l => prefix + l).join('\n');
 }
 
 function formatRelationshipContext(functions: RetrievedFunction[]): string {
@@ -155,7 +182,13 @@ function formatImpactContext(functions: RetrievedFunction[]): string {
         `   Signature: ${fn.signature}`,
       ];
       if (fn.purpose) lines.push(`   Purpose: ${fn.purpose}`);
+      if (fn.behavior) lines.push(`   Behavior: ${fn.behavior}`);
       if (fn.calls.length > 0) lines.push(`   Calls: ${fn.calls.join(', ')}`);
+      // Body is included by impactAnalysis when the result set is small
+      // enough — gives the LLM enough context to reason about HOW each
+      // caller depends on the changed function rather than just listing
+      // them.
+      if (fn.body) lines.push(`   Body:\n${indent(fn.body, '   ')}`);
       return lines.join('\n');
     }).join('\n\n');
 }
@@ -168,6 +201,13 @@ function formatFunctionList(functions: RetrievedFunction[]): string {
       `   Signature: ${fn.signature}`,
     ];
     if (fn.purpose) lines.push(`   Purpose: ${fn.purpose}`);
+    if (fn.behavior) lines.push(`   Behavior: ${fn.behavior}`);
+    if (fn.calls.length > 0) lines.push(`   Calls: ${fn.calls.slice(0, 8).join(', ')}${fn.calls.length > 8 ? '…' : ''}`);
+    // Body is populated by the retriever for narrow-result strategies
+    // (pattern with <=8 functions). Including it lets the LLM answer
+    // "how does X actually work" questions without needing to chain a
+    // follow-up direct lookup.
+    if (fn.body) lines.push(`   Body:\n${indent(fn.body, '   ')}`);
     return lines.join('\n');
   }).join('\n\n');
 }

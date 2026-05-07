@@ -66,6 +66,10 @@ export interface RetrievedFunction {
   complexity: string | null;
   calls: string[];
   calledBy: string[];
+  // Source body. Populated when the strategy specifically wants bodies in
+  // context (direct, impact, small-result pattern). Omitted otherwise to
+  // keep token usage low for broad searches.
+  body?: string;
 }
 
 export interface RetrievedType {
@@ -111,7 +115,13 @@ function emptyContext(strategy: string): RetrievedContext {
   return { functions: [], types: [], routes: [], files: [], constants: [], strategy };
 }
 
-export function directLookup(db: Database.Database, name: string): RetrievedContext {
+// Plain direct lookup — target functions only, no callee expansion.
+// Body inclusion is gated by the caller; the MCP `structx_function` tool
+// keeps it off by default and exposes an `include_body: true` opt-in to
+// preserve token-budget control for agents that just want signatures.
+// The CLI `ask` flow uses `directLookupExpanded` below to also pull in
+// callees so the answerer can reason about behavior, not just shape.
+export function directLookup(db: Database.Database, name: string, opts: { includeBody?: boolean } = {}): RetrievedContext {
   const fns = getFunctionsByName(db, name);
   if (fns.length === 0) {
     return emptyContext('direct');
@@ -119,8 +129,62 @@ export function directLookup(db: Database.Database, name: string): RetrievedCont
   const cache = buildEnrichCache(db, fns);
   return {
     ...emptyContext('direct'),
-    functions: fns.map(fn => enrichFunction(db, fn, cache)),
+    functions: fns.map(fn => enrichFunction(db, fn, cache, { includeBody: !!opts.includeBody })),
   };
+}
+
+// Direct lookup PLUS the bodies of immediate callees from the same repo.
+// Used by the LLM-backed ask flow when classifier picks `direct` strategy:
+// the answerer needs to see what the target actually does, which often
+// lives in its callees (e.g. searchTasks → listTasksByOwner is where the
+// soft-delete filter lives, not in searchTasks itself).
+export function directLookupExpanded(db: Database.Database, name: string): RetrievedContext {
+  const fns = getFunctionsByName(db, name);
+  if (fns.length === 0) {
+    return emptyContext('direct');
+  }
+  const calleeRows = collectInRepoCallees(db, fns, /* maxPerTarget */ 5);
+  const allRows = dedupeFunctionRows([...fns, ...calleeRows]);
+  const cache = buildEnrichCache(db, allRows);
+  return {
+    ...emptyContext('direct'),
+    functions: allRows.map(fn => enrichFunction(db, fn, cache, { includeBody: true })),
+  };
+}
+
+// Resolve up to maxPerTarget callees for each function passed in, returning
+// distinct in-repo function rows. Skips ambiguous/unresolved relations
+// (callee_function_id IS NULL) — those are external calls or duplicates
+// that wouldn't add useful body context.
+function collectInRepoCallees(db: Database.Database, fns: FunctionRow[], maxPerTarget: number): FunctionRow[] {
+  const ids: number[] = [];
+  const seen = new Set<number>();
+  for (const fn of fns) {
+    const callees = getCallees(db, fn.id);
+    let added = 0;
+    for (const rel of callees) {
+      if (!rel.callee_function_id) continue;
+      if (seen.has(rel.callee_function_id)) continue;
+      seen.add(rel.callee_function_id);
+      ids.push(rel.callee_function_id);
+      added++;
+      if (added >= maxPerTarget) break;
+    }
+  }
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  return db.prepare(`SELECT * FROM functions WHERE id IN (${placeholders})`).all(...ids) as FunctionRow[];
+}
+
+function dedupeFunctionRows(rows: FunctionRow[]): FunctionRow[] {
+  const seen = new Set<number>();
+  const out: FunctionRow[] = [];
+  for (const r of rows) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    out.push(r);
+  }
+  return out;
 }
 
 export function relationshipQuery(
@@ -267,7 +331,11 @@ export function impactAnalysis(db: Database.Database, name: string): RetrievedCo
   }
 
   const cache = buildEnrichCache(db, ordered);
-  return { ...emptyContext('impact'), functions: ordered.map(f => enrichFunction(db, f, cache)) };
+  // Impact answers benefit from seeing the actual caller bodies — the LLM
+  // needs to reason about HOW each caller uses the changed function, not
+  // just that it does. Cap at 8 to stay within the 3000-token budget.
+  const includeBody = ordered.length <= 8;
+  return { ...emptyContext('impact'), functions: ordered.map(f => enrichFunction(db, f, cache, { includeBody })) };
 }
 
 // ── New retriever strategies ──
@@ -493,9 +561,15 @@ export function patternQuery(db: Database.Database, keywords: string[]): Retriev
   const fileMap = new Map(allFileRows.map(f => [f.id, f.path]));
   const cache = buildEnrichCache(db, functions, types, routes, constants);
 
+  // Include function bodies when the result set is narrow enough that
+  // the LLM can actually use them — without bodies, "how does X work?"
+  // questions get a list of names without enough detail to answer.
+  // 8 functions × ~300 tokens each leaves headroom under the 3000-token
+  // budget for types, routes, and the question itself.
+  const includeBody = functions.length <= 8;
   return {
     ...emptyContext('pattern'),
-    functions: functions.map(fn => enrichFunction(db, fn, cache)),
+    functions: functions.map(fn => enrichFunction(db, fn, cache, { includeBody })),
     types: types.map(t => enrichType(db, t, cache)),
     routes: routes.map(r => enrichRoute(db, r, cache)),
     constants: constants.map(c => enrichConstant(db, c, cache)),
@@ -549,7 +623,20 @@ function resolveFilePath(db: Database.Database, fileId: number, cache?: EnrichCa
   return row?.path ?? null;
 }
 
-function enrichFunction(db: Database.Database, fn: FunctionRow, cache?: EnrichCache): RetrievedFunction {
+interface EnrichOptions {
+  // When true, include the function body in the returned RetrievedFunction.
+  // Strategies that want bodies in their answer-context (direct, impact,
+  // small-result pattern) opt in here; broad searches leave it off to
+  // keep token cost down.
+  includeBody?: boolean;
+}
+
+function enrichFunction(
+  db: Database.Database,
+  fn: FunctionRow,
+  cache?: EnrichCache,
+  opts: EnrichOptions = {},
+): RetrievedFunction {
   const path = resolveFilePath(db, fn.file_id, cache);
   const location = path ? `${path}:${fn.start_line}` : `unknown:${fn.start_line}`;
 
@@ -591,6 +678,7 @@ function enrichFunction(db: Database.Database, fn: FunctionRow, cache?: EnrichCa
     complexity: fn.complexity,
     calls: callees.map(c => c.callee_name),
     calledBy,
+    ...(opts.includeBody && fn.body ? { body: fn.body } : {}),
   };
 }
 

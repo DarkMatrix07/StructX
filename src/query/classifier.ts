@@ -92,9 +92,19 @@ function matchListEntity(lower: string): string | null {
 }
 
 function extractSearchKeywords(text: string, extraStopWords: string[] = []): string[] {
+  // Stopwords curated from real questions that misdirected the FTS retriever.
+  // Includes: question words, generic verbs ("work", "use", "handle"), common
+  // prepositions, and meta words that almost never disambiguate code lookups
+  // ("flow", "trace", "walk", "step", "end"). The flow-question regex already
+  // captured those structural cues; the keywords list should focus on the
+  // domain-specific terms.
   const stopWords = new Set([
     'what', 'which', 'show', 'list', 'all', 'does', 'do', 'the', 'for', 'with', 'that',
     'this', 'are', 'is', 'me', 'route', 'routes', 'endpoint', 'endpoints',
+    'how', 'when', 'where', 'why', 'and', 'but', 'work', 'works', 'working',
+    'end', 'flow', 'flows', 'trace', 'walk', 'walking', 'step', 'steps',
+    'handle', 'handles', 'handling', 'use', 'uses', 'using', 'cover', 'covers',
+    'through', 'across',
     ...extraStopWords,
   ]);
   return text
@@ -162,6 +172,20 @@ export function classifyQuestionFastPath(question: string): ClassificationResult
   if (conceptFiles) {
     const keywords = extractSearchKeywords(conceptFiles[1]);
     return baseResult({ strategy: 'pattern', keywords });
+  }
+
+  // 4b. Cross-cutting flow questions — "walk through the X flow", "trace
+  // the Y end to end", "step by step how does Z work" — these naturally
+  // contain words like "routes" or "endpoints" but want the SERVICE layer
+  // bodies too, not just route definitions. Route them to `pattern` before
+  // the route-detection in step 5 has a chance to swallow the question.
+  const flowQuestion =
+    /\b(?:walk\s+(?:me\s+)?through|trace|step[\s-]by[\s-]step|end[\s-]to[\s-]end|how\s+does.+\bwork\b|flow\b.+\bwork\b)/i.test(q);
+  if (flowQuestion) {
+    const keywords = extractSearchKeywords(q);
+    if (keywords.length > 0) {
+      return baseResult({ strategy: 'pattern', keywords });
+    }
   }
 
   // 5. Route — explicit HTTP verb + path, or bare /api/... reference
