@@ -135,6 +135,8 @@ Most graph tools also accept `limit`, `detail`, and `response_mode` controls. `s
 
 `structx_ask` accepts `max_tokens` per MCP call. The CLI equivalent is `structx ask "question" --max-tokens 512`; the project-wide default is `answerMaxTokens` in `.structx/config.json` and defaults to `1024`.
 
+**Streaming:** when an MCP client invokes `structx_ask` with a progress callback (the SDK adds `_meta.progressToken` automatically when you pass `onprogress` to `callTool`), the server streams the answer via `notifications/progress` — one notification per text delta with the cumulative answer length as `progress` and the chunk text as `message`. Clients that don't request progress get the existing one-shot response with no protocol overhead. Works for all three providers (Anthropic, Gemini, OpenRouter).
+
 ## All Commands
 
 | Command | Description |

@@ -12,7 +12,7 @@ import {
 } from '../db/queries';
 import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
-import { generateAnswer } from '../query/answerer';
+import { generateAnswer, generateAnswerStreaming } from '../query/answerer';
 import { getGraphFingerprint, makeAskCacheKey } from '../query/ask-cache';
 import { loadConfig, getStructXDir, getLlmConfig } from '../config';
 import { getDb, resolveRepoPath, StructxNotInitializedError, isReadonly } from './db-pool';
@@ -559,7 +559,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
       ? 'DISABLED in readonly mode. structx_ask writes to ask_cache and qa_runs. Restart the server without --readonly to enable.'
       : 'Full natural-language Q&A over the code graph. Costs LLM tokens. Honors the SHA256-keyed ask cache so identical questions are instant.',
     inputSchema: AskArgs,
-  }, async (args: any) => {
+  }, async (args: any, extra: any) => {
     if (readonly) {
       return {
         content: [{ type: 'text' as const, text: 'structx_ask is disabled in readonly mode (server started with --readonly). Use the pure-graph tools (structx_search, structx_function, etc.) or restart the server without --readonly.' }],
@@ -567,6 +567,12 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
         isError: true,
       };
     }
+    // The MCP SDK populates extra._meta.progressToken when the client called
+    // callTool with onprogress. We use it as the signal to stream — clients
+    // that don't ask for progress get the existing one-shot path with no
+    // protocol overhead.
+    const progressToken = extra?._meta?.progressToken;
+    const sendNotification = extra?.sendNotification;
     return withDbAsync(defaultRepo, args.repo_path, async (db, repo) => {
     const config = loadConfig(getStructXDir(repo));
     const answerMaxTokens = args.max_tokens ?? config.answerMaxTokens;
@@ -629,7 +635,33 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     const graphQueryTimeMs = Date.now() - graphQueryStart;
 
     const context = buildContext(retrieved, args.question);
-    const answerResult = await generateAnswer(args.question, context, config.answerModel, getLlmConfig(config), answerMaxTokens);
+
+    // Stream when the client requested progress; otherwise use the one-shot
+    // path. Streaming sends one notifications/progress per text delta with
+    // the cumulative answer length as `progress` so clients can compute a
+    // moving total without re-summing chunks.
+    let answerResult;
+    if (progressToken !== undefined && sendNotification) {
+      let accumulated = '';
+      answerResult = await generateAnswerStreaming(
+        args.question, context, config.answerModel, getLlmConfig(config), answerMaxTokens,
+        (chunk: string) => {
+          accumulated += chunk;
+          // Fire-and-forget: notification ordering doesn't matter to the
+          // final result, and awaiting each one would serialize the stream.
+          void sendNotification({
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: accumulated.length,
+              message: chunk,
+            },
+          });
+        },
+      );
+    } else {
+      answerResult = await generateAnswer(args.question, context, config.answerModel, getLlmConfig(config), answerMaxTokens);
+    }
 
     const totalInputTokens = classificationResult.inputTokens + answerResult.inputTokens;
     const totalOutputTokens = classificationResult.outputTokens + answerResult.outputTokens;

@@ -36,6 +36,11 @@ export interface LlmCompleteResponse {
 export interface LlmClient {
   provider: LlmProvider;
   complete(req: LlmCompleteRequest): Promise<LlmCompleteResponse>;
+  // Streaming variant — invokes onChunk for each text delta as the model
+  // generates, then resolves with the full final text and usage. Implementers
+  // should accumulate the chunks themselves and return the same text the
+  // non-streaming `complete` would have returned.
+  streamComplete(req: LlmCompleteRequest, onChunk: (chunk: string) => void): Promise<LlmCompleteResponse>;
 }
 
 export function createLlmClient(cfg: LlmClientConfig): LlmClient {
@@ -83,6 +88,36 @@ class AnthropicClient implements LlmClient {
       outputTokens: response.usage?.output_tokens ?? 0,
     };
   }
+
+  async streamComplete(req: LlmCompleteRequest, onChunk: (chunk: string) => void): Promise<LlmCompleteResponse> {
+    const messages: Anthropic.MessageParam[] = [
+      { role: 'user', content: req.prompt },
+    ];
+    if (req.assistantPriorTurn && req.retryUserMessage) {
+      messages.push({ role: 'assistant', content: req.assistantPriorTurn });
+      messages.push({ role: 'user', content: req.retryUserMessage });
+    }
+
+    const stream = this.client.messages.stream({
+      model: req.model,
+      max_tokens: req.maxTokens,
+      ...(req.system ? { system: req.system } : {}),
+      messages,
+    });
+
+    let fullText = '';
+    stream.on('text', (delta: string) => {
+      fullText += delta;
+      onChunk(delta);
+    });
+
+    const finalMessage = await stream.finalMessage();
+    return {
+      text: fullText,
+      inputTokens: finalMessage.usage?.input_tokens ?? 0,
+      outputTokens: finalMessage.usage?.output_tokens ?? 0,
+    };
+  }
 }
 
 class OpenRouterClient implements LlmClient {
@@ -123,6 +158,42 @@ class OpenRouterClient implements LlmClient {
       outputTokens: response.usage?.completion_tokens ?? 0,
     };
   }
+
+  async streamComplete(req: LlmCompleteRequest, onChunk: (chunk: string) => void): Promise<LlmCompleteResponse> {
+    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+    if (req.system) messages.push({ role: 'system', content: req.system });
+    messages.push({ role: 'user', content: req.prompt });
+    if (req.assistantPriorTurn && req.retryUserMessage) {
+      messages.push({ role: 'assistant', content: req.assistantPriorTurn });
+      messages.push({ role: 'user', content: req.retryUserMessage });
+    }
+
+    const stream = await this.client.chat.completions.create({
+      model: req.model,
+      max_tokens: req.maxTokens,
+      messages,
+      stream: true,
+      // OpenRouter usage stats only arrive on the final chunk when this is set.
+      stream_options: { include_usage: true },
+    });
+
+    let fullText = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content ?? '';
+      if (delta) {
+        fullText += delta;
+        onChunk(delta);
+      }
+      if (chunk.usage) {
+        inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
+        outputTokens = chunk.usage.completion_tokens ?? outputTokens;
+      }
+    }
+
+    return { text: fullText, inputTokens, outputTokens };
+  }
 }
 
 // Gemini lives behind a different SDK (REST + Google's wrapper) but the
@@ -161,6 +232,43 @@ class GeminiClient implements LlmClient {
 
     return {
       text,
+      inputTokens: usage?.promptTokenCount ?? 0,
+      outputTokens: usage?.candidatesTokenCount ?? 0,
+    };
+  }
+
+  async streamComplete(req: LlmCompleteRequest, onChunk: (chunk: string) => void): Promise<LlmCompleteResponse> {
+    const model = this.genAI.getGenerativeModel({
+      model: req.model,
+      ...(req.system ? { systemInstruction: req.system } : {}),
+      generationConfig: {
+        maxOutputTokens: req.maxTokens,
+      },
+    });
+
+    const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [
+      { role: 'user', parts: [{ text: req.prompt }] },
+    ];
+    if (req.assistantPriorTurn && req.retryUserMessage) {
+      contents.push({ role: 'model', parts: [{ text: req.assistantPriorTurn }] });
+      contents.push({ role: 'user', parts: [{ text: req.retryUserMessage }] });
+    }
+
+    const result = await model.generateContentStream({ contents });
+    let fullText = '';
+    for await (const chunk of result.stream) {
+      const delta = chunk.text();
+      if (delta) {
+        fullText += delta;
+        onChunk(delta);
+      }
+    }
+
+    // Final aggregated response carries the usage metadata.
+    const finalResponse = await result.response;
+    const usage = finalResponse.usageMetadata;
+    return {
+      text: fullText,
       inputTokens: usage?.promptTokenCount ?? 0,
       outputTokens: usage?.candidatesTokenCount ?? 0,
     };

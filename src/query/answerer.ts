@@ -49,3 +49,37 @@ export async function generateAnswer(
     responseTimeMs,
   };
 }
+
+// Streaming variant — fires onChunk for each text delta as the model
+// generates, then resolves with the same AnswerResult shape generateAnswer
+// returns. Used by the MCP `structx_ask` tool when the caller requested
+// progress notifications via _meta.progressToken; otherwise the non-
+// streaming generateAnswer path is identical and one fewer round trip.
+export async function generateAnswerStreaming(
+  question: string,
+  context: string,
+  model: string,
+  llmConfig: LlmClientConfig,
+  maxTokens: number,
+  onChunk: (chunk: string) => void,
+): Promise<AnswerResult> {
+  const client = createLlmClient(llmConfig);
+  const startTime = Date.now();
+
+  const { text, inputTokens, outputTokens } = await client.streamComplete({
+    model,
+    maxTokens,
+    system: SYSTEM_PROMPT,
+    prompt: `${context}\n\nQuestion: ${question}`,
+  }, onChunk);
+
+  const responseTimeMs = Date.now() - startTime;
+
+  return {
+    answer: text,
+    inputTokens,
+    outputTokens,
+    cost: estimateCost(model, inputTokens, outputTokens),
+    responseTimeMs,
+  };
+}
