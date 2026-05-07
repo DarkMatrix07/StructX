@@ -384,6 +384,45 @@ export function getQaRuns(db: Database.Database, mode?: string): QaRunRow[] {
   return db.prepare('SELECT * FROM qa_runs ORDER BY created_at DESC').all() as QaRunRow[];
 }
 
+// ── Dead-code analysis ──
+
+export interface DeadFunction {
+  id: number;
+  name: string;
+  filePath: string;
+  start_line: number;
+  is_exported: number;
+  signature: string;
+  purpose: string | null;
+}
+
+// Functions with zero inbound relationships — neither resolved (by id) nor
+// matched-by-name. Exported entry points (route handlers, top-level setup)
+// will appear here even though they ARE used externally; callers should
+// either filter by name pattern (e.g. exclude register*Routes) or treat the
+// list as "candidates for removal" rather than gospel.
+//
+// SQL: a function is dead if there are NO rows in `relationships` where
+// callee_function_id = its id, AND no rows where callee_name = its name.
+// The OR-NOT-EXISTS pair handles both resolved and unresolved relationships.
+export function getDeadFunctions(db: Database.Database, limit: number = 50): DeadFunction[] {
+  const rows = db.prepare(`
+    SELECT f.id, f.name, files.path as filePath, f.start_line, f.is_exported,
+           f.signature, f.purpose
+    FROM functions f
+    JOIN files ON files.id = f.file_id
+    WHERE NOT EXISTS (
+      SELECT 1 FROM relationships r WHERE r.callee_function_id = f.id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM relationships r WHERE r.callee_name = f.name
+    )
+    ORDER BY f.is_exported DESC, files.path, f.start_line
+    LIMIT ?
+  `).all(limit) as DeadFunction[];
+  return rows;
+}
+
 // ── Cost telemetry ──
 
 export interface CostStatsByMode {

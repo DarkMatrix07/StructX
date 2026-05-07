@@ -561,15 +561,21 @@ export function patternQuery(db: Database.Database, keywords: string[]): Retriev
   const fileMap = new Map(allFileRows.map(f => [f.id, f.path]));
   const cache = buildEnrichCache(db, functions, types, routes, constants);
 
-  // Include function bodies when the result set is narrow enough that
-  // the LLM can actually use them — without bodies, "how does X work?"
-  // questions get a list of names without enough detail to answer.
-  // 8 functions × ~300 tokens each leaves headroom under the 3000-token
-  // budget for types, routes, and the question itself.
-  const includeBody = functions.length <= 8;
+  // Body inclusion strategy:
+  // - When the result set is narrow (<=8 functions), include bodies for
+  //   ALL of them. The whole answer fits in the token budget.
+  // - When the result set is wide (>8), include bodies only for the top
+  //   PATTERN_TOP_BODIES (default 3) — searchFunctions returns FTS-ranked
+  //   results, so the highest-confidence matches get full fidelity while
+  //   the long tail stays as signature+purpose. Without this, the LLM
+  //   ends up hallucinating signatures of functions it can't see in
+  //   detail (real bug surfaced in StructX-demo testing).
+  const PATTERN_TOP_BODIES = 3;
   return {
     ...emptyContext('pattern'),
-    functions: functions.map(fn => enrichFunction(db, fn, cache, { includeBody })),
+    functions: functions.map((fn, i) => enrichFunction(db, fn, cache, {
+      includeBody: functions.length <= 8 || i < PATTERN_TOP_BODIES,
+    })),
     types: types.map(t => enrichType(db, t, cache)),
     routes: routes.map(r => enrichRoute(db, r, cache)),
     constants: constants.map(c => enrichConstant(db, c, cache)),

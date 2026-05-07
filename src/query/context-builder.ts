@@ -8,6 +8,15 @@ export function buildContext(retrieved: RetrievedContext, question: string): str
     retrieved.routes.length + retrieved.files.length + retrieved.constants.length;
 
   if (totalEntities === 0) {
+    // Strategy-specific empty messages. The defaults assume the agent
+    // might want to ingest more — but for `direct` and `type` lookups
+    // the right answer is "this name does not exist", not "maybe ingest".
+    if (retrieved.strategy === 'direct') {
+      return `The knowledge graph does not contain a function with that exact name. The graph IS up to date with the codebase — if you cannot see the function, it does not exist (perhaps it was renamed, deleted, or never named exactly that). Answer the user definitively that the function is absent, and suggest related names from the user's question if relevant.\n\nQuestion: ${question}`;
+    }
+    if (retrieved.strategy === 'type') {
+      return `The knowledge graph does not contain a type/interface/enum with that exact name. The graph IS up to date with the codebase — answer the user definitively that the type is absent.\n\nQuestion: ${question}`;
+    }
     return `No results found matching the query. The knowledge graph may not contain relevant data for this question. Try:\n- "structx overview --repo ." to see what entities are indexed\n- Rephrase your question with different keywords\n- Run "structx ingest ." if files were recently added\n\nQuestion: ${question}`;
   }
 

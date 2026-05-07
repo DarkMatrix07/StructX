@@ -12,6 +12,8 @@ import { closeAllDbs, setReadonly } from '../src/mcp/db-pool';
 import { registerTools } from '../src/mcp/tools';
 import { getGraphFingerprint, makeAskCacheKey } from '../src/query/ask-cache';
 import { directLookup, directLookupExpanded, impactAnalysis, listQuery, patternQuery, relationshipQuery, typeQuery } from '../src/query/retriever';
+import { getDeadFunctions } from '../src/db/queries';
+import { buildContext } from '../src/query/context-builder';
 import { insertQaRun, insertRoute, insertType, upsertFile } from '../src/db/queries';
 import { watchDirectory } from '../src/watch/watcher';
 import { openDatabase } from '../src/db/connection';
@@ -285,7 +287,7 @@ export function authorize(role: string): boolean {
     expect(ctx.functions.some(fn => fn.body && fn.body.length > 0)).toBe(true);
   });
 
-  it('patternQuery omits bodies when the result set is large to control token cost', () => {
+  it('patternQuery still gives bodies to the top FTS matches when the result set is large', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const repo = mkdtempSync(join(tmpdir(), 'structx-pattern-nobody-test-'));
     cleanup.push(repo);
@@ -305,9 +307,14 @@ export function authorize(role: string): boolean {
     const ctx = patternQuery(db, ['pulse']);
     db.close();
 
-    // With 12 matches the body gate stays closed.
+    // With 12 matches the full-body gate stays closed for most, but the
+    // top-3 FTS matches still carry bodies (fix #7 — prevents the LLM from
+    // hallucinating signatures of high-confidence matches).
     expect(ctx.functions.length).toBeGreaterThan(8);
-    expect(ctx.functions.every(fn => !fn.body)).toBe(true);
+    const withBody = ctx.functions.filter(fn => fn.body);
+    const withoutBody = ctx.functions.filter(fn => !fn.body);
+    expect(withBody.length).toBe(3);
+    expect(withoutBody.length).toBeGreaterThan(0);
   });
 
   it('honors function list limits above the old internal cap of 50', () => {
@@ -361,6 +368,7 @@ export function authorize(role: string): boolean {
       expect(listed.tools.map(t => t.name).sort()).toEqual([
         'structx_ask',
         'structx_costs',
+        'structx_dead_code',
         'structx_file',
         'structx_function',
         'structx_impact',
@@ -647,6 +655,93 @@ export function liveUpdateProbe(): string {
       await stop();
       try { watchDb.close(); } catch {}
     }
+  });
+
+  it('emits a definitive empty context message when directLookup misses', () => {
+    // Renaming a function leaves the old name absent from the graph. The
+    // empty-context message for `direct` strategy should tell the LLM the
+    // function definitively does not exist (not "maybe ingest"), so the
+    // answer can be confidently negative instead of speculative.
+    const empty = { functions: [], types: [], routes: [], files: [], constants: [], strategy: 'direct' };
+    const ctx = buildContext(empty as any, 'Does removeTask still exist?');
+    expect(ctx).toMatch(/does not contain a function with that exact name/);
+    expect(ctx).toMatch(/IS up to date/);
+    expect(ctx).not.toMatch(/Run "structx ingest"/);
+  });
+
+  it('still suggests ingest for non-direct empty results', () => {
+    const empty = { functions: [], types: [], routes: [], files: [], constants: [], strategy: 'pattern' };
+    const ctx = buildContext(empty as any, 'how does X work');
+    expect(ctx).toMatch(/structx ingest/);
+  });
+
+  it('patternQuery includes bodies for the top matches even when total result count is large', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-pattern-topbody-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    // 12 functions sharing a token — over the 8-function full-body
+    // threshold, but the top 3 FTS matches should still carry bodies so
+    // the LLM has fidelity for high-confidence matches.
+    const words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta',
+      'eta', 'theta', 'iota', 'kappa', 'lambda', 'mu'];
+    const fns = words.map((w, i) =>
+      `export function record_${w}(): number { return ${i}; }`,
+    ).join('\n');
+    writeFileSync(join(repo, 'src', 'records.ts'), fns);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const ctx = patternQuery(db, ['record']);
+    db.close();
+
+    expect(ctx.functions.length).toBeGreaterThan(8);
+    // Top 3 carry bodies; the rest do not.
+    const withBody = ctx.functions.filter(fn => fn.body);
+    const withoutBody = ctx.functions.filter(fn => !fn.body);
+    expect(withBody.length).toBe(3);
+    expect(withoutBody.length).toBeGreaterThan(0);
+  });
+
+  it('getDeadFunctions surfaces zero-caller exports and skips actively-called ones', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-dead-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    // `livelyHelper` and `helperOfHelper` are both transitively called from
+    // an outer chain that has a function caller. `unusedHelper` and
+    // `internalDead` have no callers anywhere and should appear as dead.
+    writeFileSync(join(repo, 'src', 'sample.ts'), `
+export function helperOfHelper(): number { return 7; }
+
+export function livelyHelper(x: number): number { return x + helperOfHelper(); }
+
+export function entryPoint(): number { return livelyHelper(42); }
+
+// outer() is called by entryPoint, transitively keeping the chain alive.
+function outer(): number { return entryPoint(); }
+
+export function publicCaller(): number { return outer(); }
+
+export function unusedHelper(x: number): number { return x * 2; }
+
+function internalDead(): void { /* never called */ }
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const dead = getDeadFunctions(db, 50);
+    db.close();
+
+    const names = dead.map(d => d.name);
+    // The two genuinely uncalled functions are flagged.
+    expect(names).toContain('unusedHelper');
+    expect(names).toContain('internalDead');
+    // Functions in the active call chain are NOT flagged.
+    expect(names).not.toContain('helperOfHelper');
+    expect(names).not.toContain('livelyHelper');
+    expect(names).not.toContain('entryPoint');
+    expect(names).not.toContain('outer');
   });
 
   it('keeps graph fingerprints stable when only QA run history changes', () => {

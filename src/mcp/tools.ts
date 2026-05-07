@@ -8,7 +8,7 @@ import {
 import {
   getStats, getFullOverview,
   getCachedAskResponse, insertCachedAskResponse, insertQaRun,
-  getFunctionsByName, getCostStats,
+  getFunctionsByName, getCostStats, getDeadFunctions,
 } from '../db/queries';
 import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
@@ -98,6 +98,13 @@ const AskArgs = z.object({
 }).strict();
 const CostsArgs = z.object({
   recent_limit: z.number().int().min(1).max(100).optional().describe('Number of most-recent runs to include in the response. Defaults to 10.'),
+  response_mode: ResponseMode,
+  repo_path: RepoPath,
+}).strict();
+const DeadCodeArgs = z.object({
+  limit: z.number().int().min(1).max(200).optional().describe('Maximum dead functions to return. Defaults to 50.'),
+  exclude_pattern: z.string().optional().describe('JS regex pattern to exclude from results (e.g. "^register.*Routes" to drop framework setup functions).'),
+  exported_only: z.boolean().optional().describe('When true, only include exported functions (the most useful candidates for removal in a library).'),
   response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
@@ -553,7 +560,45 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     return toolResponse(lines.join('\n'), stats, args.response_mode);
   }));
 
-  // ── 11. structx_ask ────────────────────────────────────────────────────
+  // ── 11. structx_dead_code ──────────────────────────────────────────────
+  server.registerTool('structx_dead_code', {
+    description: 'Find functions with zero inbound references (neither resolved nor name-matched). Useful for pre-refactor cleanup — surface exports nothing else calls.',
+    inputSchema: DeadCodeArgs,
+  }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
+    const all = getDeadFunctions(db, args.limit ?? 50);
+    let filtered = all;
+    if (args.exported_only) filtered = filtered.filter((f: any) => f.is_exported);
+    if (args.exclude_pattern) {
+      let re: RegExp | null = null;
+      try { re = new RegExp(args.exclude_pattern); } catch { re = null; }
+      if (re) filtered = filtered.filter(f => !re!.test(f.name));
+    }
+
+    const exported = filtered.filter((f: any) => f.is_exported);
+    const internal = filtered.filter((f: any) => !f.is_exported);
+    const lines = [`# Dead functions: ${filtered.length}`, ''];
+    if (exported.length > 0) {
+      lines.push('## Exported (callers may live in another package)');
+      for (const f of exported) {
+        const purpose = f.purpose ? ` — ${f.purpose}` : '';
+        lines.push(`- **${f.name}** \`${f.filePath}:${f.start_line}\`${purpose}`);
+      }
+      lines.push('');
+    }
+    if (internal.length > 0) {
+      lines.push('## Internal (almost certainly safe to remove)');
+      for (const f of internal) {
+        const purpose = f.purpose ? ` — ${f.purpose}` : '';
+        lines.push(`- **${f.name}** \`${f.filePath}:${f.start_line}\`${purpose}`);
+      }
+    }
+    if (filtered.length === 0) {
+      lines.push('_None — every function has at least one caller._');
+    }
+    return toolResponse(lines.join('\n'), { dead: filtered, exported, internal }, args.response_mode);
+  }));
+
+  // ── 12. structx_ask ────────────────────────────────────────────────────
   server.registerTool('structx_ask', {
     description: readonly
       ? 'DISABLED in readonly mode. structx_ask writes to ask_cache and qa_runs. Restart the server without --readonly to enable.'
