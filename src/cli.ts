@@ -46,7 +46,7 @@ function formatProviderError(err: any): string {
 program
   .name('structx')
   .description('Graph-powered code intelligence CLI for TypeScript')
-  .version('3.1.0')
+  .version('3.1.1')
   .option('--verbose', 'Enable verbose logging')
   .hook('preAction', (thisCommand) => {
     if (thisCommand.opts().verbose) {

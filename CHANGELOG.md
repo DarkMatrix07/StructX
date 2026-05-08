@@ -2,6 +2,74 @@
 
 All notable changes to StructX. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.1.1] — 2026-05-08
+
+Battle-testing patch. Cloned and ingested two real OSS TypeScript repos
+(honojs/hono and tRPC) before promoting v3.1.0 publicly. Five real
+correctness bugs surfaced — all five fixed and verified end-to-end.
+
+### Fixed
+
+- **Unqualified function name lookup misses class methods.** Asking
+  `structx_function 'add'` on hono returned "not found" even though the
+  graph had `RegExpRouter.add`, `LinearRouter.add`, etc. The MCP tool
+  and the LLM `direct` strategy used `name = ?` exact match against the
+  qualified storage. Now an unqualified name (no dot) falls back to a
+  `LIKE '%.add'` query that finds every method with that bare name.
+  Hooked into directLookup, directLookupExpanded, relationshipQuery,
+  and impactAnalysis.
+
+- **Class declarations weren't indexed as types.** `class Hono` was
+  invisible to `structx_type` because the type extractor only walked
+  interfaces, type aliases, and enums. Now `getClasses()` runs alongside
+  with `kind: 'class'` and a compact signature ("class Hono extends
+  HonoBase<E, S, BasePath>"). Schema migrated to allow the new kind;
+  existing DBs auto-migrate at open time. Verified on hono: 48 classes
+  picked up, including `Hono`, `HonoBase`, `RegExpRouter`, `TrieRouter`.
+
+- **Test/benchmark/config files polluted the production graph.**
+  hono first-ingest reported 1338 routes — every one was from
+  `benchmarks/`, `runtime-tests/`, or `*.test.ts` test fixtures. Added
+  `DEFAULT_SOURCE_EXCLUDES` for `*.test.ts`, `*.spec.ts`, `__tests__/`,
+  `__mocks__/`, `__fixtures__/`, `*.bench.ts`, `benchmarks/`,
+  `runtime-tests/`, `*.config.ts`, `*.config.{js,mjs,cjs}`,
+  `.vitest.config/`, `.storybook/`, `*.stories.{ts,tsx}`. New
+  `.structxignore` file (same syntax as `.gitignore`) lets users opt
+  back in with `!**/*.test.ts` etc.
+
+- **Monorepo non-library paths flooded the graph.** tRPC first-ingest
+  picked up 264 files from `examples/`, 52 from `www/` (the docs
+  site), and ~280 from `packages/tests/` — 47% of the index was demo
+  apps, docs, and test packages, not library source. Extended defaults
+  with `examples/`, `example/`, `demo/`, `demos/`, `playground/`,
+  `playgrounds/`, `www/`, `website/`, `docs-site/`, `scripts/`,
+  `e2e/`, plus bare `tests/` and `test/` for the workspace-package
+  case. After fix on tRPC: files 676 → 358 → 149 (78% reduction),
+  ingest 41s → 12s.
+
+- **Analyzer hammered a dead provider on 402 / 401.** When an
+  OpenRouter key ran out of credit mid-batch, StructX kept calling
+  the endpoint 1100 more times before reporting "Failed: 1100" with
+  no actionable explanation. Now `isFatalProviderError(err)` detects
+  402 (credits) / 401 (auth) and trips an `aborted` flag on the
+  result; the four batch loops in analyzer.ts (functions, types,
+  routes, file summaries) and the CLI's outer loop all respect it.
+  The CLI prints a clear actionable reason and tells the user that
+  failed items remain queued for retry.
+
+### Added
+
+- `.structxignore` file support — same syntax as `.gitignore`, applied
+  AFTER both built-in defaults and `.gitignore`, so projects that DO
+  want to index tests / examples / etc. can negate with `!**/*.test.ts`.
+
+### Tests
+
+65 tests passing across 16 files (up from 55 across 15). New tests
+cover all five fixes plus the `isFatalProviderError` detector
+(402 status, OpenRouter message text, 401 auth, transient 5xx not
+fatal, null errors not fatal).
+
 ## [3.1.0] — 2026-05-08
 
 The first release with the full Model Context Protocol server. AI agents (Claude Desktop, Cursor, Continue, Cline) can now call StructX as a native tool — no shell-out, persistent connection, ~4 ms p50 latency.
