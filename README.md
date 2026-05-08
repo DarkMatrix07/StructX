@@ -1,85 +1,193 @@
 # StructX
 
-Graph-powered code intelligence for TypeScript. Drop into any project and let AI agents (Claude Code, Cursor, Copilot) use a function-level knowledge graph instead of reading raw files.
+**Graph-powered code intelligence for TypeScript.** Drop into any project and your AI agent (Claude Code, Cursor, Copilot, Continue, Cline) gets a function-level knowledge graph instead of grepping raw files. Queries that took several file reads collapse into a single millisecond-latency call.
+
+[![npm](https://img.shields.io/npm/v/structx.svg)](https://www.npmjs.com/package/structx)
+
+```
+agent: "what breaks if I change validateEmail?"
+              ↓
+StructX:  3 ms graph query → 4 callers, transitive impact, source bodies
+              ↓
+agent answers definitively, no file reads
+```
+
+---
 
 ## Quick Start
 
 Two commands to set up any TypeScript project:
 
 ```bash
-# 1. Install AI agent instruction files into your project
+# 1. Drop AI-agent instruction files into your project
 npx structx install .
 
 # 2. Bootstrap the function graph (init + ingest + analyze)
 npx structx setup .
 ```
 
-That's it. Your AI agent will now automatically use StructX when it reads the instruction files.
+That's it. Your agent will now use StructX automatically when it reads the instruction files.
 
-## LLM Providers
+For MCP-aware editors (Claude Desktop, Cursor, Continue, Cline), add the [MCP integration block](#mcp-integration) to your client config and restart.
 
-StructX supports three LLM providers. Set **any one** API key and it just works:
+---
 
-| Environment Variable | Provider | Default Models |
-|---------------------|----------|----------------|
-| `ANTHROPIC_API_KEY` | Anthropic (Claude) | `claude-haiku-4-5` / `claude-sonnet-4-5` |
-| `GEMINI_API_KEY` | Google Generative AI (Gemini) | `gemini-2.0-flash` / `gemini-2.5-pro` |
-| `OPENROUTER_API_KEY` | OpenRouter (any model) | `google/gemini-2.5-flash` |
+## Table of contents
 
-Provider selection can be pinned in `.structx/config.json` with `"provider": "anthropic"`, `"provider": "gemini"`, or `"provider": "openrouter"`. If no provider is pinned, detection priority is Anthropic > Gemini > OpenRouter.
+- [Why StructX](#why-structx)
+- [Quick start](#quick-start)
+- [Requirements](#requirements)
+- [LLM providers](#llm-providers)
+- [What it builds](#what-it-builds)
+- [How agents use it](#how-agents-use-it)
+- [MCP integration](#mcp-integration)
+  - [Tool reference](#tool-reference)
+  - [Editor configs](#editor-configs)
+  - [Readonly mode](#readonly-mode)
+  - [Streaming `structx_ask`](#streaming-structx_ask)
+- [CLI reference](#cli-reference)
+- [Watch mode](#watch-mode)
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+- [Cost guide](#cost-guide)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Status](#status)
+- [Contributing](#contributing)
 
-Set the key in your environment or in a `.env` file in your project root:
+---
 
-```bash
-# Pick one:
-ANTHROPIC_API_KEY=sk-ant-...
-GEMINI_API_KEY=AI...
-OPENROUTER_API_KEY=sk-or-...
-```
+## Why StructX
 
-## What Happens
+When an AI agent works on a codebase, the default behavior is to read files until it has enough context. That's slow, expensive, and the picture is always partial.
 
-**Step 1 — `npx structx install .`** creates these files in your project:
+StructX builds a **persistent SQLite knowledge graph** of every function, type, route, and constant in your TypeScript codebase, plus the call relationships between them. Then it exposes that graph as an MCP server with 12 query tools, plus a CLI for ad-hoc questions.
 
-| File | For |
-|------|-----|
-| `CLAUDE.md` | Claude Code |
-| `AGENTS.md` | Multi-agent setups |
-| `.cursorrules` | Cursor |
-| `.github/copilot-instructions.md` | GitHub Copilot |
+The result: instead of "let me read 4 files to understand authentication," the agent calls `structx_search { keywords: ["authentication"] }` and gets a ranked, body-rich answer in **~10 ms**.
 
-If any of these files already exist, StructX appends its section instead of overwriting.
+**What's in the graph:**
+- Function signatures, bodies, side effects, complexity tags, purpose summaries
+- Direct + transitive call relationships (recursive CTE for impact analysis)
+- Type definitions (interface / type alias / enum) with full source text
+- HTTP routes (method + path + handler body) auto-detected from Express-style code
+- File-level summaries (LOC, exports, imports, semantic purpose)
+- Constants with values and type annotations
 
-**Step 2 — `npx structx setup .`** does three things in one shot:
+**What you get out:**
+- 12 MCP tools with strict JSON Schema (`additionalProperties: false`)
+- Cross-cutting impact analysis ("what breaks if I change X")
+- Semantic search ("how is auth handled?")
+- Dead-code detection ("what exports have zero callers?")
+- Cost telemetry, ask-response cache, graph-fingerprint cache invalidation
+- Watch mode for incremental graph updates as you code
 
-1. **Init** — creates `.structx/` directory with a SQLite database
-2. **Ingest** — parses all TypeScript files into a function graph (signatures, call relationships, exports, types, routes, constants)
-3. **Analyze** — enriches each function with semantic metadata via LLM (purpose, behavior, tags)
+---
 
 ## Requirements
 
-- Node.js >= 18
-- One LLM API key: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`
+- **Node.js ≥ 18**
+- **One LLM API key**: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`
+- **TypeScript / TSX source files** (StructX scans `.ts` / `.tsx`, ignores `.d.ts`)
+- StructX honors your project's `.gitignore` plus a hard `node_modules`/`.git`/`.structx` skip list
 
-## How AI Agents Use It
+---
 
-Once installed, the instruction files tell your AI agent to:
+## LLM providers
 
-1. Run `npx structx status` on session start to check the graph
-2. Run `npx structx ask "question" --repo .` before answering code questions
-3. Run `npx structx ingest .` after making code changes
-4. Run `npx structx analyze . --yes` after ingestion queues new functions
-5. Run `npx structx ask "what breaks if I change X" --repo .` for impact analysis
+Set **any one** API key and StructX picks it up automatically:
 
-## MCP Integration
+| Environment variable | Provider | Default models |
+|----------------------|----------|----------------|
+| `ANTHROPIC_API_KEY` | Anthropic | `claude-haiku-4-5` (analyze/classify), `claude-sonnet-4-5` (answer) |
+| `GEMINI_API_KEY` | Google Generative AI | `gemini-2.0-flash` (analyze/classify), `gemini-2.5-pro` (answer) |
+| `OPENROUTER_API_KEY` | OpenRouter | `anthropic/claude-haiku-4.5` / `anthropic/claude-sonnet-4.5` |
 
-StructX can run as a Model Context Protocol server over stdio, so MCP-aware editors can call the knowledge graph directly instead of shelling out to `structx ask`.
+**Detection priority** when multiple are set: `ANTHROPIC` > `GEMINI` > `OPENROUTER`.
+
+To pin a provider explicitly, edit `.structx/config.json`:
+
+```json
+{ "provider": "openrouter", "answerModel": "anthropic/claude-sonnet-4.5" }
+```
+
+You can also drop the key in a `.env` file at your project root.
+
+---
+
+## What it builds
+
+`npx structx install .` writes these instruction files (idempotent — appends if they exist):
+
+| File | Tells |
+|------|-------|
+| `CLAUDE.md` | Claude Code |
+| `AGENTS.md` | Multi-agent setups (Codex, autonomous loops) |
+| `.cursorrules` | Cursor |
+| `.github/copilot-instructions.md` | GitHub Copilot |
+
+`npx structx setup .` runs three steps in one shot:
+
+1. **Init** — creates `.structx/db.sqlite` and `.structx/config.json`, adds `.structx/` to your `.gitignore`
+2. **Ingest** — scans every `.ts`/`.tsx` file, extracts functions / types / routes / constants / call relationships into the graph
+3. **Analyze** — runs the LLM over each function/type/route to attach `purpose`, `behavior_summary`, `side_effects`, `domain`, `complexity`, plus per-file purpose summaries
+
+Re-running `setup` is safe: only changed files are re-ingested (content-hash gated), and only changed-or-new functions are re-analyzed (semantic-cache gated). A typical re-run on an unchanged repo is sub-second.
+
+---
+
+## How agents use it
+
+After `npx structx install .`, the instruction files tell your AI agent to:
+
+1. Run `structx status` at session start to confirm the graph is fresh
+2. Run `structx ask "..."` (or call MCP tools) before answering code questions
+3. Run `structx ingest .` after making code changes
+4. Run `structx analyze . --yes` after ingestion queues new functions
+
+For MCP-aware editors, the server runs persistently and tools respond in milliseconds — no shell-out per question.
+
+---
+
+## MCP integration
+
+StructX runs as a Model Context Protocol server over stdio. Most modern AI editors support MCP — wire it up once and your assistant gets the graph as native tools.
 
 ```bash
 structx mcp --repo /abs/path/to/your/repo
 ```
 
-Example **Claude Desktop** configuration (`claude_desktop_config.json`):
+The server logs to **stderr** (stdout is reserved for MCP frames) and stays alive until the parent client disconnects.
+
+### Tool reference
+
+12 tools, all accept an optional `repo_path` to override the server default:
+
+| Tool | What it returns | LLM cost |
+|------|-----------------|----------|
+| `structx_search` | Functions/types/routes/files/constants matching keywords (FTS5). Optional `scope` to limit kinds, `mode: "broad"` for cross-cutting concerns. | Free |
+| `structx_function` | Full details for one function: signature, location, callers, callees, side effects. `include_body: true` for source text. | Free |
+| `structx_relationships` | Direct callers (`direction: "callers"`) or callees (`"callees"`) of a function. | Free |
+| `structx_impact` | Direct + transitive callers via recursive CTE. Bodies included for results ≤ 8. | Free |
+| `structx_route` | HTTP routes by path/method. `path_match: "exact"` to avoid substring hits. | Free |
+| `structx_type` | Type/interface/enum by name. Falls back to FTS + identifier-tokenized fuzzy match. | Free |
+| `structx_file` | File overview (functions/types/routes/constants). Empty path = all files. | Free |
+| `structx_list` | Enumerate one entity kind (`routes` \| `types` \| `files` \| `functions` \| `constants`). | Free |
+| `structx_overview` | Repo-wide stats + truncated cross-section. | Free |
+| `structx_costs` | Cost telemetry: total spend, p50/p95 latency by mode, cache hit ratio, recent runs. | Free |
+| `structx_dead_code` | Functions with zero inbound references. Splits exported (callers may be elsewhere) vs internal. | Free |
+| `structx_ask` | Full LLM-backed Q&A — classifier → retriever → context-builder → answerer. Honors graph-fingerprinted cache. | $$ |
+
+**Common args** (most graph tools): `limit`, `detail` (`"summary"` | `"full"`), `response_mode` (`"both"` | `"text"` | `"structured"`).
+
+- `detail: "summary"` (default) returns compact `structuredContent`; `"full"` returns every field.
+- `response_mode: "structured"` returns a short text stub plus full structured data; `"text"` keeps markdown but swaps structured data for counts; `"both"` is the default.
+- `structx_search` additionally takes `scope: ["functions", "types", "routes", "files", "constants"]` to drop entity kinds the agent doesn't care about.
+- `structx_function` accepts `include_body: true` when the assistant needs exact source.
+- `structx_ask` accepts `max_tokens` per call (overrides `answerMaxTokens` from `.structx/config.json`).
+
+### Editor configs
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -92,7 +200,7 @@ Example **Claude Desktop** configuration (`claude_desktop_config.json`):
 }
 ```
 
-**Cursor** — add to `~/.cursor/mcp.json` (or via Settings → MCP):
+**Cursor** — `~/.cursor/mcp.json` (or Settings → MCP):
 
 ```json
 {
@@ -105,7 +213,7 @@ Example **Claude Desktop** configuration (`claude_desktop_config.json`):
 }
 ```
 
-**Continue** — add to `~/.continue/config.yaml`:
+**Continue** — `~/.continue/config.yaml`:
 
 ```yaml
 mcpServers:
@@ -117,66 +225,251 @@ mcpServers:
       - /abs/path/to/your/repo
 ```
 
-**Cline / Roo** — same shape as Claude Desktop, in the extension's MCP settings.
+**Cline / Roo** — same shape as Claude Desktop, in the extension's MCP settings panel.
 
-For shared/protected repos where the MCP server should never write to the graph, add `--readonly`:
+### Readonly mode
+
+For shared or protected repos where the MCP server should never mutate the graph, add `--readonly`:
 
 ```json
 "args": ["mcp", "--repo", "/path", "--readonly"]
 ```
 
-This opens the SQLite DB read-only and disables `structx_ask` (which writes to `ask_cache` and `qa_runs`); all other tools work normally.
+This opens the SQLite DB read-only and disables `structx_ask` (which writes to `ask_cache` and `qa_runs`). Every other tool works normally — perfect for read-only deployments where humans run `structx ingest` separately.
 
-The server exposes these tools: `structx_search`, `structx_function`, `structx_relationships`, `structx_impact`, `structx_route`, `structx_type`, `structx_file`, `structx_list`, `structx_overview`, `structx_costs`, `structx_dead_code`, and `structx_ask`. Each tool accepts an optional `repo_path` argument to override the server default for that call. `structx_ask` is the only LLM-backed tool; the others query the local SQLite graph directly. `structx_costs` rolls up spend, latency percentiles, and cache-hit ratio from past runs. `structx_dead_code` finds functions with zero inbound references — useful for pre-refactor cleanup.
+### Streaming `structx_ask`
 
-Most graph tools also accept `limit`, `detail`, and `response_mode` controls. `structx_search` additionally accepts `scope: ["functions"]` (or any combination of `functions`, `types`, `routes`, `files`, `constants`) so the agent can request only the entity kinds it cares about. `detail: "summary"` is the default and returns compact `structuredContent`; `detail: "full"` returns all retrieved fields. `response_mode: "both"` is the default, `response_mode: "structured"` returns a short text stub plus full structured data, and `response_mode: "text"` keeps markdown while replacing structured data with counts. `structx_function` omits the function body by default; pass `include_body: true` when the assistant needs exact source for a target function.
+When an MCP client passes an `onprogress` callback to `callTool` (the SDK attaches `_meta.progressToken` automatically), the server streams the answer via `notifications/progress` — one notification per text delta carrying the cumulative answer length as `progress` and the chunk text as `message`. Clients that don't request progress get the one-shot response with no overhead. Works on Anthropic, Gemini, and OpenRouter.
 
-`structx_route` also accepts `path_match: "exact"` when an assistant needs `/api/tasks` without substring matches like `/api/tasks/:id/archive`.
+---
 
-`structx_ask` accepts `max_tokens` per MCP call. The CLI equivalent is `structx ask "question" --max-tokens 512`; the project-wide default is `answerMaxTokens` in `.structx/config.json` and defaults to `1024`.
-
-**Streaming:** when an MCP client invokes `structx_ask` with a progress callback (the SDK adds `_meta.progressToken` automatically when you pass `onprogress` to `callTool`), the server streams the answer via `notifications/progress` — one notification per text delta with the cumulative answer length as `progress` and the chunk text as `message`. Clients that don't request progress get the existing one-shot response with no protocol overhead. Works for all three providers (Anthropic, Gemini, OpenRouter).
-
-## All Commands
+## CLI reference
 
 | Command | Description |
 |---------|-------------|
-| `npx structx install .` | Drop instruction files into your project |
-| `npx structx setup .` | One-step bootstrap (init + ingest + analyze) |
-| `npx structx status` | Show graph stats |
-| `npx structx overview --repo .` | Full codebase summary (no API key needed) |
-| `npx structx ingest .` | Re-parse codebase after changes |
-| `npx structx analyze . --yes` | Run semantic analysis on new/changed functions |
-| `npx structx ask "question" --repo .` | Query the function graph |
-| `npx structx mcp --repo .` | Run the MCP server over stdio |
-| `npx structx doctor` | Validate environment and configuration |
-| `npx structx benchmark run --repo .` | Run comparison benchmark (StructX vs traditional) |
+| `structx install [repo]` | Drop instruction files into the project |
+| `structx setup [repo]` | One-step bootstrap (init + ingest + analyze) |
+| `structx init [repo]` | Create `.structx/` and config without ingest |
+| `structx ingest [repo]` | Parse codebase into the graph |
+| `structx watch [repo]` | Watch mode — incremental graph updates as files change |
+| `structx analyze [repo] --yes` | Run semantic analysis on new/changed functions |
+| `structx status` | Show graph stats (files, functions, relationships, etc.) |
+| `structx overview --repo .` | Full codebase summary, no API key needed |
+| `structx ask "..." --repo .` | Natural-language query against the graph |
+| `structx mcp --repo . [--readonly]` | Run the MCP server over stdio |
+| `structx doctor` | Validate environment, config, and DB |
+| `structx benchmark run --repo .` | StructX vs file-reading benchmark |
 
-## Query Examples
+`structx ask` accepts `--max-tokens 64..8192` to bound the answer cost.
+
+`structx mcp` accepts `--repo <path>` (default cwd) and `--readonly`.
+
+---
+
+## Watch mode
 
 ```bash
-# List all routes/endpoints
-npx structx ask "what routes exist?" --repo .
-
-# Understand a specific function
-npx structx ask "what does verifyPassword do?" --repo .
-
-# Trace authentication flow
-npx structx ask "how does authentication work?" --repo .
-
-# List types and interfaces
-npx structx ask "what types and interfaces exist?" --repo .
-
-# Impact analysis
-npx structx ask "what breaks if I change the User type?" --repo .
+structx watch .
 ```
 
-## .gitignore
+Monitors the repo via `fs.watch` (recursive, no extra deps) and keeps the graph in sync as you edit. Saves are coalesced into a single SQLite transaction with batched post-processing — drains 50-file bursts in one flush. Honors `.gitignore` plus the always-skip directories.
 
-Add this to your `.gitignore`:
+| Event | Output |
+|-------|--------|
+| File added | `+ src/foo.ts — 3 fns, 1 types, 0 routes, 1 consts (1 queued)` |
+| File modified | `~ src/foo.ts — 3 fns, 1 types, 0 routes, 1 consts (2 queued)` |
+| File deleted | `− src/foo.ts` |
+| Burst (>1 file) | `↻ 50 files (50 added) in 480ms` |
+
+Run `structx watch` in one terminal and `structx mcp` in another (Claude Desktop, etc.) — the MCP server picks up watcher commits via SQLite WAL automatically.
+
+`--no-initial-ingest` skips the warm-up scan when the graph is already current.
+
+---
+
+## Architecture
 
 ```
-.structx/
+┌─────────────────┐
+│  TypeScript     │
+│  source files   │
+└────────┬────────┘
+         │ ts-morph parser
+         ▼
+┌─────────────────────────────────────────────────────────┐
+│  SQLite knowledge graph (.structx/db.sqlite, WAL mode)  │
+│                                                         │
+│  files ──┬─ functions ──── relationships (call graph)   │
+│          ├─ types                                       │
+│          ├─ routes                                      │
+│          ├─ constants                                   │
+│          └─ file_summaries                              │
+│                                                         │
+│  + FTS5 indexes (functions_fts, types_fts, routes_fts)  │
+│  + ask_cache (SHA256(question + model + graph))         │
+│  + qa_runs (telemetry)                                  │
+│  + analysis_queue (LLM enrichment pipeline)             │
+└─────────────────────────────────────────────────────────┘
+         ▲                                ▲
+         │ ingest pipeline                │ retrieval pipeline
+         │                                │
+┌────────┴───────────┐         ┌──────────┴──────────────┐
+│  ingester          │         │  classifier             │
+│  semantic analyzer │         │  retriever (10 strats)  │
+│  watcher           │         │  context-builder        │
+│                    │         │  answerer (3 providers) │
+└────────────────────┘         └──────────┬──────────────┘
+                                          │
+                               ┌──────────┴──────────┐
+                               │  CLI    │   MCP     │
+                               │  ask    │   12 tools│
+                               └─────────┴───────────┘
 ```
 
-The `.structx/` directory contains the SQLite database and is local to each developer.
+**Ingest pipeline** (`src/ingest/`): scanner → parser (ts-morph) → file/function/type/route/constant extractors → relationships → SQLite write.
+
+**Retrieval pipeline** (`src/query/`):
+1. **Classifier** — fast-path regex first (zero-cost), LLM fallback. Picks one of 10 strategies.
+2. **Retriever** — strategy-specific SQL: direct lookup, relationships, semantic FTS, domain filter, impact CTE, route lookup, type lookup, file overview, list, pattern (broad FTS).
+3. **Context builder** — formats results to fit a 3000-token budget; includes function bodies for narrow result sets and top-N FTS matches.
+4. **Answerer** — single shot or streamed.
+
+**Cache invalidation**: ask cache keys are `SHA256(question.lowercase.trim() | model | maxTokens | graphFingerprint)`. The graph fingerprint covers every code-shaping row and is stable across QA-run history changes — so identical questions return instantly while real code changes invalidate cleanly.
+
+---
+
+## Configuration
+
+`.structx/config.json` is created by `structx init` / `structx setup`. Defaults are filled in by `loadConfig`:
+
+```jsonc
+{
+  "repoPath": "/abs/path/to/repo",
+  "provider": "anthropic",            // anthropic | gemini | openrouter
+  "anthropicApiKey": "",              // optional, falls back to env
+  "baseURL": "",                      // optional, override provider endpoint
+  "analysisModel": "claude-haiku-4-5-20251001",
+  "classifierModel": "claude-haiku-4-5-20251001",
+  "answerModel": "claude-sonnet-4-5-20250929",
+  "answerMaxTokens": 1024,            // 64..8192
+  "batchSize": 8,                     // semantic analysis batch
+  "diffThreshold": 0.3                // re-analyze when ≥30% of body changed
+}
+```
+
+`structxDir` is filled in at runtime; you don't set it.
+
+---
+
+## Cost guide
+
+Rough numbers from running on a 10-file demo project (~38 functions, ~12 routes):
+
+| Operation | Tokens | Cost (Anthropic) |
+|-----------|--------|------------------|
+| Initial `setup` (ingest + analyze 38 functions, 12 types, 10 routes, 9 file summaries) | ~6 K in / ~2 K out | **~$0.02** |
+| Re-`setup` after editing 5 functions (only those re-analyzed) | ~1 K in / ~300 out | **~$0.003** |
+| One `ask` (cache miss, pattern strategy, ~30 entities) | ~3 K in / ~400 out | **~$0.005** |
+| One `ask` (cache hit) | 0 | **$0.0000** |
+
+OpenRouter with `anthropic/claude-haiku-4.5` is roughly equivalent. Gemini Flash is ~4× cheaper for analysis; Pro for answers is similar to Sonnet.
+
+For a 1000-function codebase, expect first-time setup around **$0.30–$0.80** depending on provider and how detailed the functions are. Subsequent ingests are sub-dollar because of the diff-gated re-analysis. Run `structx_costs` (or check `qa_runs`) at any time for actual numbers.
+
+---
+
+## Performance
+
+Latency on a warm MCP connection (10 graph tools, real demo repo):
+
+| Tool | p50 | p95 |
+|------|-----|-----|
+| `structx_function` | 3 ms | 7 ms |
+| `structx_type` | 3 ms | 3 ms |
+| `structx_relationships` | 4 ms | 5 ms |
+| `structx_impact` | 4 ms | 4 ms |
+| `structx_search` | 8 ms | 8 ms |
+| `structx_overview` | 33 ms | 272 ms (proportional to repo size) |
+| **Median across all tools** | **4 ms** | **33 ms** |
+
+Cold-start (per-call subprocess) is ~1–2 s — that's why production usage keeps the MCP server warm.
+
+Watch mode end-to-end latency (file save → DB visible to readers): **~160 ms median**.
+
+---
+
+## Troubleshooting
+
+**"Config not found at .../.structx/config.json"** — Run `structx init .` or `structx setup .` first.
+
+**"Provider returned 402 insufficient credits"** — Out of API credit on the configured provider. Either add credits, switch providers via `.structx/config.json`, or rely on the graph-only tools (every MCP tool except `structx_ask` works without an LLM).
+
+**"WARNING: No functions have been semantically analyzed"** — Ingest succeeded but analyze didn't. Run `structx analyze . --yes`. If you want the basic graph without paying for analysis, just keep using `structx ask` — it'll still work but answers will be less rich.
+
+**MCP tools return empty results after I added a new file** — Either run `structx ingest .` or use `structx watch` for automatic updates.
+
+**FTS search misses camelCase identifiers** — FTS5's default tokenizer doesn't split on case. Workaround: query `structx_function { name: "yourCamelCase" }` for exact lookups, or use kebab-case / snake_case in keywords.
+
+**`tsc` heap out of memory in this repo's own build** — bump Node memory: `NODE_OPTIONS=--max-old-space-size=4096 npm run build`.
+
+**Watch mode reports `ENOENT` for files that exist** — Some editors do atomic-rename writes (write-tmp + rename). Wait ~100 ms; the watcher's debounce should pick up the final state.
+
+**Recent question hits the cache when I expected fresh analysis** — The cache key includes the graph fingerprint. If your code didn't change, the cache hits. To force a fresh answer, change one character of the question or run `structx ingest .` after a real edit.
+
+---
+
+## Status
+
+**v3.0.x — published on npm, used in real projects.**
+
+Strong:
+- 12 MCP tools, strict schemas, three providers, streaming, multi-repo, readonly
+- Graph-fingerprint cache invalidation, watch mode with batched flush, dead-code finder
+- 55 tests including end-to-end MCP via `InMemoryTransport`
+- p50 4 ms tool latency on warm connection
+
+Honest gaps:
+- **Language coverage**: TypeScript only. JavaScript and Python are obvious next targets but not built.
+- **Method-call resolution**: `obj.foo()` and chained calls degrade to NULL callees in some cases. Function-to-function call graph is solid; OO call graph has edges that don't resolve.
+- **Type-relationship graph**: function call graph is full; type-extends-type and field-of-type relationships aren't tracked.
+- **Scale**: tested up to ~50-file projects. 1000+ file performance is unverified.
+- **Git integration**: no `structx diff <ref>` or PR-impact tool yet. Combine with `git diff` manually for now.
+
+See [GitHub issues](https://github.com/DarkMatrix07/StructX/issues) for the live list.
+
+---
+
+## Contributing
+
+```bash
+git clone https://github.com/DarkMatrix07/StructX
+cd StructX
+npm install
+npm run build
+npm test                              # 55 tests
+node dist/cli.js setup ./scratch-repo  # try it on your own repo
+```
+
+The codebase is itself indexed by StructX — once built, you can run `node dist/cli.js mcp --repo .` and use any MCP client to explore the implementation.
+
+`src/` layout:
+
+| Path | What |
+|------|------|
+| `src/cli.ts` | Commander entry point |
+| `src/db/` | Schema, queries, migrations |
+| `src/ingest/` | Parser, scanner, extractors, relationships, watcher hooks |
+| `src/query/` | Classifier, retriever, context-builder, answerer, ask-cache |
+| `src/mcp/` | Server, tool registry, db-pool, format helpers |
+| `src/semantic/` | LLM-backed function/type/route analyzers |
+| `src/watch/` | Watcher with batched flush + per-file debounce |
+| `src/utils/` | Unified LLM client (Anthropic + Gemini + OpenRouter), token costs, paths, FTS sanitizer |
+| `tests/` | Vitest specs, including real MCP client/server via InMemoryTransport |
+
+Add a test for any new behavior. The existing pattern (per-tool integration tests in `tests/mcp-tools.test.ts`) is a good template.
+
+---
+
+## License
+
+ISC.
