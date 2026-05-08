@@ -38,11 +38,17 @@ For MCP-aware editors (Claude Desktop, Cursor, Continue, Cline), add the [MCP in
 
 - [Why StructX](#why-structx)
 - [Quick start](#quick-start)
+- [Setup with AI agents — full walkthrough](#setup-with-ai-agents--full-walkthrough)
+  - [Step 1 — Install StructX globally](#step-1--install-structx-globally)
+  - [Step 2 — Index your repo](#step-2--index-your-repo)
+  - [Step 3 — Wire it into your AI client](#step-3--wire-it-into-your-ai-client)
+  - [Step 4 — Verify it loaded](#step-4--verify-it-loaded)
+  - [Step 5 — Use it](#step-5--use-it)
 - [Requirements](#requirements)
 - [LLM providers](#llm-providers)
 - [What it builds](#what-it-builds)
 - [How agents use it](#how-agents-use-it)
-- [MCP integration](#mcp-integration)
+- [MCP integration reference](#mcp-integration-reference)
   - [Tool reference](#tool-reference)
   - [Editor configs](#editor-configs)
   - [Readonly mode](#readonly-mode)
@@ -56,6 +62,184 @@ For MCP-aware editors (Claude Desktop, Cursor, Continue, Cline), add the [MCP in
 - [Troubleshooting](#troubleshooting)
 - [Status](#status)
 - [Contributing](#contributing)
+
+---
+
+## Setup with AI agents — full walkthrough
+
+Zero to working in five minutes. Each step is a single command or one paste.
+
+### Step 1 — Install StructX globally
+
+```bash
+npm install -g structx
+```
+
+Verify:
+
+```bash
+structx --version    # → 3.1.0
+```
+
+If `structx` isn't found, your npm global bin isn't on PATH. Run `npm config get prefix` to see where global packages live and add `<prefix>/bin` (Unix) or `<prefix>` (Windows) to PATH.
+
+### Step 2 — Index your repo
+
+Set one LLM API key in your shell environment or in a `.env` file at your repo root:
+
+```bash
+# Pick ONE:
+export ANTHROPIC_API_KEY="sk-ant-..."        # Claude
+export GEMINI_API_KEY="AI..."                # Google Gemini
+export OPENROUTER_API_KEY="sk-or-..."        # OpenRouter (any model)
+```
+
+Then in your TypeScript project's directory:
+
+```bash
+cd /abs/path/to/your/repo
+structx setup .
+```
+
+This does three things:
+
+1. Creates `.structx/` with a SQLite knowledge graph.
+2. Parses every `.ts`/`.tsx` file (functions, types, routes, constants, call relationships).
+3. Runs the LLM over each entity to attach `purpose`, `behavior_summary`, `side_effects`, etc.
+
+For a 100-function repo this takes ~30 seconds and costs roughly $0.05. Re-runs are diff-gated and near-free.
+
+> **Tip:** add `structx watch .` in a separate terminal to keep the graph live while you code.
+
+### Step 3 — Wire it into your AI client
+
+Pick the client you use. Each one needs the StructX MCP server registered exactly once.
+
+#### Claude Desktop
+
+Edit (or create) `claude_desktop_config.json`:
+
+| OS | Path |
+|----|------|
+| **Windows** | `%APPDATA%\Claude\claude_desktop_config.json` |
+| **macOS** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Linux** | `~/.config/Claude/claude_desktop_config.json` |
+
+Add (or merge) this block:
+
+```json
+{
+  "mcpServers": {
+    "structx": {
+      "command": "structx",
+      "args": ["mcp", "--repo", "/abs/path/to/your/repo"]
+    }
+  }
+}
+```
+
+> Windows paths must use **escaped backslashes** (`"C:\\Users\\you\\repo"`) or **forward slashes** (`"C:/Users/you/repo"`). A single `\` is a JSON parse error.
+
+**Fully quit and re-launch Claude Desktop** (just closing the window doesn't reload the config).
+
+#### Claude Code (CLI)
+
+```bash
+claude mcp add structx -- structx mcp --repo "$(pwd)"
+claude mcp list                                          # confirm it shows up
+```
+
+To remove later: `claude mcp remove structx`.
+
+#### Cursor
+
+Edit `~/.cursor/mcp.json` (or use Settings → MCP):
+
+```json
+{
+  "mcpServers": {
+    "structx": {
+      "command": "structx",
+      "args": ["mcp", "--repo", "/abs/path/to/your/repo"]
+    }
+  }
+}
+```
+
+Restart Cursor.
+
+#### Continue
+
+Add to `~/.continue/config.yaml`:
+
+```yaml
+mcpServers:
+  - name: structx
+    command: structx
+    args:
+      - mcp
+      - --repo
+      - /abs/path/to/your/repo
+```
+
+#### Cline / Roo
+
+Same JSON shape as Claude Desktop, in the extension's MCP settings panel.
+
+#### Multiple repos
+
+Two patterns:
+
+1. **One server, switch per call.** Keep the default `--repo`, then in the chat you can ask for any repo:
+   *"Use structx_search with `repo_path: '/abs/path/to/other-repo'` for keywords ['auth']."*
+2. **One server per repo.** Register them as `structx-projectA`, `structx-projectB`, etc., each with its own `--repo`. The agent sees them as distinct toolsets.
+
+#### Shared / read-only deployments
+
+Add `--readonly` to the args. The MCP server opens the DB read-only and disables `structx_ask` (which writes cache + run logs). Other 11 tools work normally — perfect for shared dev environments where you only want consumers, not writers:
+
+```json
+"args": ["mcp", "--repo", "/path/to/repo", "--readonly"]
+```
+
+### Step 4 — Verify it loaded
+
+**Claude Desktop:** open a new chat, click the **🔌 plug icon** at the bottom of the message box. You should see `structx` listed with **12 tools**:
+
+```
+structx_search          structx_function       structx_relationships
+structx_impact          structx_route          structx_type
+structx_file            structx_list           structx_overview
+structx_costs           structx_dead_code      structx_ask
+```
+
+If StructX isn't there, open **Developer → Open MCP Logs** and look for spawn errors. The most common causes are:
+
+- `structx` not on PATH (run `where structx` / `which structx` to confirm).
+- Wrong repo path or unescaped backslashes on Windows.
+- `.structx/` directory doesn't exist in the target repo (run `structx setup .` there).
+
+**Claude Code:** running `claude mcp list` should show `structx`. If a tool call returns `Tool not found`, restart your terminal so the registry reloads.
+
+### Step 5 — Use it
+
+You don't have to teach the agent anything special — it'll pick the right tool from your normal questions. A few examples:
+
+| You ask | Tool the agent picks | What it saves |
+|---------|---------------------|---------------|
+| *"What does verifyPassword do?"* | `structx_function` (with `include_body: true`) | 1 file read |
+| *"What breaks if I change the User type?"* | `structx_impact` + `structx_type` | 5+ file reads |
+| *"How does authentication work in this codebase?"* | `structx_search` (broad mode) | 4–6 file reads |
+| *"List every route I have."* | `structx_list` (`entity: "routes"`) | 1–2 file reads |
+| *"Find dead exports I can delete."* | `structx_dead_code` | a manual audit |
+
+You can also be explicit when you want to:
+
+- *"Use structx_overview to summarize this codebase before we start."*
+- *"Use structx to trace what happens when a user calls /api/auth/login end to end."*
+- *"Find every function that touches the database, then suggest a single chokepoint to add audit logging."*
+
+When you're done with a session, `structx_costs` gives you a roll-up of how much it cost.
 
 ---
 
@@ -150,7 +334,9 @@ For MCP-aware editors, the server runs persistently and tools respond in millise
 
 ---
 
-## MCP integration
+## MCP integration reference
+
+> If you just want to get started, jump to [Setup with AI agents — full walkthrough](#setup-with-ai-agents--full-walkthrough). The section below is the detailed reference.
 
 StructX runs as a Model Context Protocol server over stdio. Most modern AI editors support MCP — wire it up once and your assistant gets the graph as native tools.
 
