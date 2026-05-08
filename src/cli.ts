@@ -21,6 +21,7 @@ import { generateMarkdownReport, generateCsvReport, saveReport } from './benchma
 import { ingestDirectory, printIngestResult } from './ingest/ingester';
 import { watchDirectory } from './watch/watcher';
 import { runMcpServer } from './mcp/server';
+import { diffEntities } from './git/diff';
 
 const program = new Command();
 
@@ -46,7 +47,7 @@ function formatProviderError(err: any): string {
 program
   .name('structx')
   .description('Graph-powered code intelligence CLI for TypeScript')
-  .version('3.1.1')
+  .version('3.2.0')
   .option('--verbose', 'Enable verbose logging')
   .hook('preAction', (thisCommand) => {
     if (thisCommand.opts().verbose) {
@@ -553,6 +554,56 @@ program
     };
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+  });
+
+// ── diff ──
+program
+  .command('diff')
+  .description('Show indexed entities changed since a git ref (commit / branch / tag)')
+  .argument('<ref>', 'git ref to diff against, e.g. HEAD~1, main, abc1234')
+  .option('--repo <path>', 'Repository path', '.')
+  .option('--json', 'Emit machine-readable JSON instead of the human summary')
+  .action(async (ref: string, opts: { repo: string; json?: boolean }) => {
+    const resolved = path.resolve(opts.repo);
+    const structxDir = getStructXDir(resolved);
+    const dbPath = getDbPath(structxDir);
+    if (!fs.existsSync(dbPath)) {
+      console.log('StructX not initialized. Run "structx init" first.');
+      return;
+    }
+    const db = openDatabase(dbPath);
+
+    let result;
+    try {
+      result = diffEntities(db, resolved, ref);
+    } catch (err: any) {
+      console.error(err.message);
+      db.close();
+      process.exit(1);
+    }
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(`Changed since ${ref}: ${result.changedFiles.length} files`);
+    if (result.functions.length > 0) {
+      console.log(`\nFunctions (${result.functions.length}):`);
+      for (const fn of result.functions) console.log(`  [${fn.status}] ${fn.name}  ${fn.file}`);
+    }
+    if (result.types.length > 0) {
+      console.log(`\nTypes (${result.types.length}):`);
+      for (const t of result.types) console.log(`  [${t.status}] ${t.kind} ${t.name}  ${t.file}`);
+    }
+    if (result.routes.length > 0) {
+      console.log(`\nRoutes (${result.routes.length}):`);
+      for (const r of result.routes) console.log(`  [${r.status}] ${r.method} ${r.path}  ${r.file}`);
+    }
+    if (result.unindexedFiles.length > 0) {
+      console.log(`\nChanged but not in graph (${result.unindexedFiles.length}):`);
+      for (const f of result.unindexedFiles) console.log(`  ${f}`);
+    }
   });
 
 // ── mcp ──

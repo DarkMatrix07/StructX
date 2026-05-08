@@ -320,6 +320,118 @@ export interface RouterOptions {
     expect(optionsCtx.types[0]?.kind).toBe('interface');
   });
 
+  it('ingests plain JavaScript and JSX files alongside TypeScript', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Real-world case: most "TypeScript" repos still have a .js entry
+    // point, .mjs config, or a few .jsx leftover from a migration.
+    // The graph should pick up exported functions from all three.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-js-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'lib.ts'), `export function tsFunction(): number { return 1; }`);
+    writeFileSync(join(repo, 'src', 'helper.js'), `export function jsFunction() { return 2; }`);
+    writeFileSync(join(repo, 'src', 'component.jsx'), `export function JsxComponent() { return <div>hi</div>; }`);
+    writeFileSync(join(repo, 'src', 'esm.mjs'), `export function mjsFunction() { return 3; }`);
+    writeFileSync(join(repo, 'src', 'cjs.cjs'), `module.exports.cjsFunction = function() { return 4; };`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const fns = listQuery(db, 'functions').functions.map(fn => fn.name).sort();
+    db.close();
+
+    expect(fns).toContain('tsFunction');
+    expect(fns).toContain('jsFunction');
+    expect(fns).toContain('JsxComponent');
+    expect(fns).toContain('mjsFunction');
+  });
+
+  it('resolves method calls (obj.method) to qualified class methods', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Real-world case: a function holds an instance variable and calls
+    // `instance.method()`. The ingester records the relationship as
+    // `caller -> "instance.method"`, but the qualified storage is
+    // `ClassName.method`. Variables aren't tracked through type
+    // inference, so without the second-pass suffix resolver, the call
+    // graph would lose every `obj.method` edge to the actual class.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-method-resolve-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'app.ts'), `
+export class Service {
+  doWork(): number { return 42; }
+}
+
+export function consumer(): number {
+  const svc = new Service();
+  return svc.doWork();   // → recorded as "svc.doWork", should resolve to Service.doWork
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    // The Service.doWork method should now have `consumer` listed as a caller.
+    const callers = relationshipQuery(db, 'doWork', 'callers');
+    db.close();
+
+    expect(callers.functions.map(fn => fn.name)).toContain('consumer');
+  });
+
+  it('extracts decorator-style routes (NestJS @Controller + @Get/@Post)', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-decorator-routes-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    // Stub the @Controller / @Get / etc. decorators so the file actually
+    // type-checks for ts-morph. We don't need real NestJS — the extractor
+    // matches on decorator NAME, so any decorator named Controller / Get
+    // / Post / etc. is recognized.
+    writeFileSync(join(repo, 'src', 'cats.ts'), `
+function Controller(path?: string): ClassDecorator { return () => {}; }
+function Get(path?: string): MethodDecorator { return () => {}; }
+function Post(path?: string): MethodDecorator { return () => {}; }
+function Delete(path?: string): MethodDecorator { return () => {}; }
+function Param(name: string): ParameterDecorator { return () => {}; }
+
+@Controller('cats')
+export class CatsController {
+  @Get()
+  findAll(): string { return 'all cats'; }
+
+  @Get(':id')
+  findOne(@Param('id') id: string): string { return 'cat ' + id; }
+
+  @Post()
+  create(): string { return 'created'; }
+
+  @Delete(':id')
+  remove(@Param('id') id: string): string { return 'removed ' + id; }
+}
+
+@Controller()
+export class HealthController {
+  @Get('health')
+  health(): string { return 'ok'; }
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const allRoutes = listQuery(db, 'routes');
+    db.close();
+
+    const byMethodPath = allRoutes.routes.map(r => `${r.method} ${r.path}`).sort();
+    expect(byMethodPath).toEqual([
+      'DELETE /cats/:id',
+      'GET /cats',          // @Get() under @Controller('cats')
+      'GET /cats/:id',
+      'GET /health',         // @Controller() (no base) + @Get('health')
+      'POST /cats',
+    ]);
+    // Handler names are class-qualified.
+    expect(allRoutes.routes.find(r => r.path === '/cats/:id' && r.method === 'GET')?.handlerName)
+      .toBe('CatsController.findOne');
+  });
+
   it('falls back from unqualified to qualified method names in directLookup', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     // Simulates an OO codebase where the agent asks for a method by its
@@ -553,6 +665,7 @@ export function authorize(role: string): boolean {
         'structx_impact',
         'structx_list',
         'structx_overview',
+        'structx_pr_impact',
         'structx_relationships',
         'structx_route',
         'structx_search',

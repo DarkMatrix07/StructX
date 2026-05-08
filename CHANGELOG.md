@@ -2,6 +2,122 @@
 
 All notable changes to StructX. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] — 2026-05-08
+
+Major capability release. Closes the four largest functional gaps from
+v3.1's "honest gaps" section — bundling them so users get one significant
+upgrade rather than a stream of patch releases. Bundles all v3.1.1
+battle-test fixes too (it was never published).
+
+### Added — feature-shaped
+
+#### Decorator-based routes (NestJS, Tsoa, routing-controllers)
+
+The route extractor previously knew only Express-style `app.get('/path',
+handler)`. Class-decorator routes — the dominant pattern in NestJS,
+Stencil, Next.js App Router, etc. — were completely invisible. Now
+`@Controller(basePath)` on a class plus `@Get/@Post/@Put/@Delete/@Patch/
+@All/@Head/@Options(methodPath)` on its methods are extracted as full
+routes with method, joined path (`/users/:id`), class-qualified handler
+name (`UsersController.findOne`), and method body for context.
+
+Verified on a synthetic NestJS fixture: 7 controller methods → 7 routes
+(`GET /users`, `POST /users`, `PATCH /users/:id`, `DELETE /users/:id`,
+`GET /users/:id`, `GET /orders`, `POST /orders/:id/cancel`).
+
+#### JavaScript and JSX support
+
+`.js`, `.jsx`, `.mjs`, `.cjs` files now ingest alongside `.ts`/`.tsx`.
+ts-morph already had `allowJs: true, jsx: 2` in the parser project — the
+only blocker was the scanner extension whitelist. Test/spec/bench
+exclude patterns extended to cover JS variants too. Real-world impact:
+Express servers written in plain JS, Vite configs, build scripts, and
+mixed JS/TS migrations all index correctly now.
+
+#### Method-call resolution
+
+The single biggest correctness gap before this release. Method calls
+like `svc.doWork()` were recorded as `callee_name = "svc.doWork"` —
+but the qualified storage in the functions table is `Service.doWork`,
+because the variable `svc` isn't tracked through type inference.
+Result: every `obj.method()` edge in the call graph stayed NULL, and
+`structx_impact Service.doWork` missed callers that referenced the
+method through a variable.
+
+Fix: a second pass in `resolveNullCallees` runs after the exact-name
+pass. For relationships with a dot in `callee_name` (e.g. `svc.doWork`)
+where exact match failed, it tries to bind to a function whose name
+ends in `.<methodName>`. Conservative — only links when exactly one
+candidate exists, same rule as the existing exact-match pass — so
+ambiguous methods don't produce false positives.
+
+Verified on a fixture with `class Service { doWork() {} }` and a
+free function calling `new Service().doWork()`: `structx_relationships
+{ name: "doWork", direction: "callers" }` now finds the consumer.
+
+#### Git integration — `structx diff` + `structx_pr_impact`
+
+New `structx diff <ref>` CLI command and matching `structx_pr_impact`
+MCP tool. Both run `git diff --name-status <ref>` to find changed
+files, then map those paths to indexed graph entities (functions,
+types, routes). Combined with `structx_impact`, an agent can answer
+"what does this PR actually touch and what's the blast radius?"
+without reading any source.
+
+CLI:
+  structx diff HEAD~1
+  structx diff main --json
+
+MCP:
+  structx_pr_impact { ref: "HEAD~1" }
+  structx_pr_impact { ref: "main", repo_path: "/abs/path" }
+
+Verified end-to-end against a synthetic 2-commit repo: HEAD~1 picks up
+both modifications and additions, classifies status correctly
+(`added` / `modified` / `deleted` / `renamed`), and surfaces files
+that changed but aren't in the graph (excluded paths or deletions).
+
+### Added — bundled from v3.1.1 battle-test patches
+
+Five real-world correctness fixes from clone-and-test runs on hono,
+tRPC, and NestJS before public promotion:
+
+- **Unqualified function name fallback** — `structx_function 'add'`
+  now finds qualified methods (`RegExpRouter.add`, `LinearRouter.add`,
+  etc.) when no exact bare-name match exists.
+- **Class declarations indexed as types** — `class Hono` is no longer
+  invisible to `structx_type`. 48 classes captured in hono alone.
+  Schema migrated; existing DBs auto-upgrade at open time.
+- **Source-quality default excludes** — `*.test.ts`, `*.spec.ts`,
+  `__tests__/`, `__mocks__/`, `__fixtures__/`, `tests/`, `test/`,
+  `*.bench.ts`, `benchmarks/`, `runtime-tests/`, `*.config.ts`,
+  `*.config.{js,mjs,cjs}`, `.vitest.config/`, `.storybook/`,
+  `*.stories.{ts,tsx}` (TS+JS variants).
+- **Monorepo non-library default excludes** — `examples/`, `example/`,
+  `demo/`, `demos/`, `sample/`, `samples/`, `playground/`,
+  `playgrounds/`, `www/`, `website/`, `docs-site/`, `scripts/`,
+  `e2e/`. All recursive (`**/foo/**`) so nested occurrences are
+  caught at any depth.
+- **`.structxignore` file support** — same syntax as `.gitignore`,
+  applied AFTER built-in defaults and `.gitignore`. Negate with
+  `!**/*.test.ts` to opt back in.
+- **Analyzer aborts cleanly on 402 / 401** — instead of hammering a
+  dead provider for hundreds of doomed calls, surface the actionable
+  reason ("out of credits — top up at provider dashboard") and tell
+  the user that failed items remain queued for retry.
+
+### Tests
+
+71 tests passing across 17 files (was 55 across 15 in 3.1.0). New tests:
+
+- `tests/git-diff.test.ts` (new file) — real `git init` + two commits +
+  `diffEntities` against `HEAD~1`, verifies file/function/type detection
+  and clean error on missing refs.
+- decorator-style route extractor (NestJS @Controller + @Get/@Post)
+- JS/JSX/MJS file ingestion alongside TS
+- Method-call `svc.doWork() → Service.doWork` resolution
+- `structx_pr_impact` in the tools/list MCP smoke test
+
 ## [3.1.1] — 2026-05-08
 
 Battle-testing patch. Cloned and ingested two real OSS TypeScript repos

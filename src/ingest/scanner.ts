@@ -17,7 +17,11 @@ export const ALWAYS_SKIP_DIRS = new Set([
   'tmp',
   'temp',
 ]);
-export const TS_EXTENSIONS = new Set(['.ts', '.tsx']);
+// Extensions StructX is willing to ingest. ts-morph parses JS in the same
+// pipeline as TS — for plain .js the parser falls back to JSX/JS syntax
+// trees. Hardening for real-world repos (most have at least one .js
+// config or build script even when the source is otherwise TS).
+export const TS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 
 // Returns a matcher used by both `scanDirectory` and watch mode so the same
 // ignore rules apply during ingestion and incremental updates.
@@ -51,18 +55,26 @@ export function scanDirectory(rootPath: string): string[] {
 // can add `!**/*.test.ts` etc. to a `.structxignore` file or override via
 // config (see CONTRIBUTING for the override pattern).
 const DEFAULT_SOURCE_EXCLUDES = [
-  // Tests, fixtures, mocks
+  // Tests, fixtures, mocks (TS + JS)
   '**/*.test.ts',
   '**/*.test.tsx',
+  '**/*.test.js',
+  '**/*.test.jsx',
+  '**/*.test.mjs',
   '**/*.spec.ts',
   '**/*.spec.tsx',
+  '**/*.spec.js',
+  '**/*.spec.jsx',
+  '**/*.spec.mjs',
   '**/__tests__/**',
   '**/__mocks__/**',
   '**/__fixtures__/**',
   '**/tests/**',
   '**/test/**',
   '**/*.bench.ts',
+  '**/*.bench.js',
   '**/*.benchmark.ts',
+  '**/*.benchmark.js',
   '**/benchmarks/**',
   '**/runtime-tests/**',
 

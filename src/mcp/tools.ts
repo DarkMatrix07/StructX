@@ -13,6 +13,7 @@ import {
 import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
 import { generateAnswer, generateAnswerStreaming } from '../query/answerer';
+import { diffEntities } from '../git/diff';
 import { getGraphFingerprint, makeAskCacheKey } from '../query/ask-cache';
 import { loadConfig, getStructXDir, getLlmConfig } from '../config';
 import { getDb, resolveRepoPath, StructxNotInitializedError, isReadonly } from './db-pool';
@@ -105,6 +106,11 @@ const DeadCodeArgs = z.object({
   limit: z.number().int().min(1).max(200).optional().describe('Maximum dead functions to return. Defaults to 50.'),
   exclude_pattern: z.string().optional().describe('JS regex pattern to exclude from results (e.g. "^register.*Routes" to drop framework setup functions).'),
   exported_only: z.boolean().optional().describe('When true, only include exported functions (the most useful candidates for removal in a library).'),
+  response_mode: ResponseMode,
+  repo_path: RepoPath,
+}).strict();
+const PrImpactArgs = z.object({
+  ref: z.string().describe('Git ref to diff against. Common: "HEAD~1" (last commit), "main" (PR base), "<sha>" (specific commit).'),
   response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
@@ -598,7 +604,57 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     return toolResponse(lines.join('\n'), { dead: filtered, exported, internal }, args.response_mode);
   }));
 
-  // ── 12. structx_ask ────────────────────────────────────────────────────
+  // ── 12. structx_pr_impact ─────────────────────────────────────────────
+  server.registerTool('structx_pr_impact', {
+    description: 'Map files changed since a git ref to indexed graph entities (functions, types, routes). Combine with structx_impact for transitive blast radius. Useful for "what does this PR actually touch" answers.',
+    inputSchema: PrImpactArgs,
+  }, async (args: any) => withDb(defaultRepo, args.repo_path, (db, repo) => {
+    let result;
+    try {
+      result = diffEntities(db, repo, args.ref);
+    } catch (err: any) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err.message}` }],
+        structuredContent: { ref: args.ref, error: err.message },
+        isError: true,
+      };
+    }
+
+    const lines: string[] = [
+      `# Changed since \`${args.ref}\``,
+      '',
+      `- **Files changed:** ${result.changedFiles.length}`,
+      `- **Functions affected:** ${result.functions.length}`,
+      `- **Types affected:** ${result.types.length}`,
+      `- **Routes affected:** ${result.routes.length}`,
+    ];
+    if (result.unindexedFiles.length > 0) {
+      lines.push(`- **Changed but not indexed:** ${result.unindexedFiles.length} (excluded paths or deleted files)`);
+    }
+    if (result.functions.length > 0) {
+      lines.push('', '## Functions');
+      for (const fn of result.functions.slice(0, 50)) {
+        lines.push(`- \`[${fn.status}]\` **${fn.name}** \`${fn.file}\``);
+      }
+      if (result.functions.length > 50) lines.push(`- _… and ${result.functions.length - 50} more_`);
+    }
+    if (result.types.length > 0) {
+      lines.push('', '## Types');
+      for (const t of result.types.slice(0, 30)) {
+        lines.push(`- \`[${t.status}]\` **${t.kind} ${t.name}** \`${t.file}\``);
+      }
+    }
+    if (result.routes.length > 0) {
+      lines.push('', '## Routes');
+      for (const r of result.routes.slice(0, 30)) {
+        lines.push(`- \`[${r.status}]\` **${r.method} ${r.path}** \`${r.file}\``);
+      }
+    }
+
+    return toolResponse(lines.join('\n'), result, args.response_mode);
+  }));
+
+  // ── 13. structx_ask ────────────────────────────────────────────────────
   server.registerTool('structx_ask', {
     description: readonly
       ? 'DISABLED in readonly mode. structx_ask writes to ask_cache and qa_runs. Restart the server without --readonly to enable.'

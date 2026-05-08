@@ -603,16 +603,47 @@ export function getStats(db: Database.Database): Stats {
 // ── Callee resolution ──
 
 export function resolveNullCallees(db: Database.Database): number {
-  // Only bind a NULL relationship when the callee name resolves to exactly one
-  // function. Ambiguous names are left NULL so impact analysis doesn't return
-  // false positives for unrelated same-named functions.
-  const result = db.prepare(`
+  // Pass 1: bind NULL relationships when the callee name matches exactly
+  // one function. Ambiguous names are left NULL so impact analysis doesn't
+  // return false positives for unrelated same-named functions.
+  const exact = db.prepare(`
     UPDATE relationships SET callee_function_id = (
       SELECT f.id FROM functions f WHERE f.name = relationships.callee_name LIMIT 1
     ) WHERE callee_function_id IS NULL
       AND (SELECT COUNT(*) FROM functions f WHERE f.name = relationships.callee_name) = 1
   `).run();
-  return result.changes;
+
+  // Pass 2 — method-call resolution on `obj.method` patterns.
+  // The relationships ingester records method calls verbatim (`f.bar`, `obj.method`),
+  // but variables aren't tracked through type inference, so `f.bar` doesn't
+  // match the qualified storage `Foo.bar` that came from the class extractor.
+  // For relationships still NULL with a dot in the callee_name (e.g. "x.fooBar"),
+  // try to bind to a uniquely-suffixed method (e.g. "Bar.fooBar"). Multiple
+  // candidates → leave NULL (same conservative rule as exact match).
+  //
+  // Performance: the WHERE filter on `callee_function_id IS NULL` and the
+  // `INSTR(callee_name, '.') > 0` predicate keep this scoped to just the
+  // relationships that need the second-pass treatment.
+  const suffix = db.prepare(`
+    UPDATE relationships
+       SET callee_function_id = (
+         SELECT f.id
+           FROM functions f
+          WHERE f.name LIKE '%.' || SUBSTR(relationships.callee_name, INSTR(relationships.callee_name, '.') + 1)
+            AND f.name != relationships.callee_name
+          LIMIT 1
+       )
+     WHERE callee_function_id IS NULL
+       AND INSTR(callee_name, '.') > 0
+       AND (
+         SELECT COUNT(*)
+           FROM functions f
+          WHERE f.name LIKE '%.' || SUBSTR(relationships.callee_name, INSTR(relationships.callee_name, '.') + 1)
+            AND f.name != relationships.callee_name
+       ) = 1
+  `).run();
+
+  return exact.changes + suffix.changes;
 }
 
 // ── Impact analysis (recursive CTE) ──
