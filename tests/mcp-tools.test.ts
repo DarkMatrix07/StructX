@@ -114,6 +114,57 @@ afterEach(() => {
 });
 
 describe('MCP graph tools', () => {
+  it('excludes test/benchmark/config files from the default source graph', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Battle-tested case from hono: 1338 fake "routes" coming from
+    // benchmarks/, runtime-tests/, and *.test.ts files polluting the
+    // graph. The default source-quality excludes should drop all of
+    // these and leave only the genuine production code.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-source-quality-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'benchmarks'), { recursive: true });
+    mkdirSync(join(repo, 'runtime-tests'), { recursive: true });
+    mkdirSync(join(repo, 'src', '__tests__'), { recursive: true });
+
+    const productionFn = `export function realProduction(): number { return 1; }`;
+    writeFileSync(join(repo, 'src', 'real.ts'), productionFn);
+    // All of these should be excluded:
+    writeFileSync(join(repo, 'src', 'real.test.ts'), `export function tested(): number { return 1; }`);
+    writeFileSync(join(repo, 'src', 'real.spec.ts'), `export function spec(): number { return 2; }`);
+    writeFileSync(join(repo, 'src', '__tests__', 'helpers.ts'), `export function helper(): number { return 3; }`);
+    writeFileSync(join(repo, 'benchmarks', 'fast.ts'), `export function bench(): number { return 4; }`);
+    writeFileSync(join(repo, 'runtime-tests', 'lambda.ts'), `export function runtime(): number { return 5; }`);
+    writeFileSync(join(repo, 'vite.config.ts'), `export default {};`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const files = getAllFiles(db).map(f => f.path).sort();
+    db.close();
+
+    expect(files).toEqual(['src/real.ts']);
+  });
+
+  it('honors .structxignore overrides to re-enable excluded files', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // For projects that DO want to index tests (e.g. for coverage tooling
+    // or when tests are the only source), .structxignore's negation rules
+    // apply after the defaults.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-override-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'real.ts'), `export function real(): number { return 1; }`);
+    writeFileSync(join(repo, 'src', 'real.test.ts'), `export function tested(): number { return 1; }`);
+    writeFileSync(join(repo, '.structxignore'), '!**/*.test.ts\n');
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const files = getAllFiles(db).map(f => f.path).sort();
+    db.close();
+
+    expect(files).toEqual(['src/real.test.ts', 'src/real.ts']);
+  });
+
   it('does not ingest local agent worktrees or scratch directories', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const { dbPath } = createIndexedRepo();
@@ -173,6 +224,77 @@ describe('MCP graph tools', () => {
       'src/features/alternate-invoice.ts:1',
       'src/features/billing-service.ts:4',
     ]);
+  });
+
+  it('indexes class declarations alongside interfaces / type aliases / enums', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Battle-tested case: hono's class Hono / class RegExpRouter were
+    // invisible to structx_type before this fix because the type
+    // extractor only looked at interfaces, type aliases, and enums.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-classes-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'app.ts'), `
+export class Hono {
+  fetch(req: Request): Response { return new Response(); }
+}
+
+export class RegExpRouter extends Hono {
+  add(method: string, path: string): void { /* impl */ }
+}
+
+export interface RouterOptions {
+  caseSensitive: boolean;
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const honoCtx = typeQuery(db, 'Hono');
+    const routerCtx = typeQuery(db, 'RegExpRouter');
+    const optionsCtx = typeQuery(db, 'RouterOptions');
+    db.close();
+
+    expect(honoCtx.types[0]?.name).toBe('Hono');
+    expect(honoCtx.types[0]?.kind).toBe('class');
+    expect(routerCtx.types[0]?.kind).toBe('class');
+    expect(routerCtx.types[0]?.fullText).toContain('extends Hono');
+    // Existing interface lookup still works alongside.
+    expect(optionsCtx.types[0]?.kind).toBe('interface');
+  });
+
+  it('falls back from unqualified to qualified method names in directLookup', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Simulates an OO codebase where the agent asks for a method by its
+    // bare name (`add`) without knowing which class it lives on. Battle-
+    // tested case: hono's RegExpRouter.add, LinearRouter.add, etc. The
+    // exact lookup misses; the unqualified-fallback should find them all.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-unqualified-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'routers.ts'), `
+export class RegExpRouter {
+  add(method: string, path: string): void { /* impl */ }
+}
+
+export class LinearRouter {
+  add(method: string, path: string): void { /* impl */ }
+}
+
+export class TrieRouter {
+  add(method: string, path: string): void { /* impl */ }
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const ctx = directLookup(db, 'add');
+    db.close();
+
+    const names = ctx.functions.map(fn => fn.name).sort();
+    expect(names).toContain('RegExpRouter.add');
+    expect(names).toContain('LinearRouter.add');
+    expect(names).toContain('TrieRouter.add');
   });
 
   it('does not collapse duplicate function names to an arbitrary first match', () => {

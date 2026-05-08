@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS types (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK(kind IN ('interface', 'type_alias', 'enum')),
+  kind TEXT NOT NULL CHECK(kind IN ('interface', 'type_alias', 'enum', 'class')),
   full_text TEXT NOT NULL,
   is_exported BOOLEAN DEFAULT 0,
   start_line INTEGER NOT NULL,

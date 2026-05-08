@@ -40,10 +40,47 @@ export function scanDirectory(rootPath: string): string[] {
   return results.sort();
 }
 
+// Default exclude patterns for non-source TypeScript files. Tests, benchmarks,
+// and config-as-code files are usually committed alongside source but
+// shouldn't be in a code-intelligence graph an agent uses for reasoning
+// about what the app does — they create false routes (test-fixture HTTP
+// handlers), false types (mock interfaces), and noise in dead-code analysis.
+//
+// Battle-tested on hono, where these patterns prevented 1000+ test routes
+// from polluting the production graph. Users who DO want to index tests
+// can add `!**/*.test.ts` etc. to a `.structxignore` file or override via
+// config (see CONTRIBUTING for the override pattern).
+const DEFAULT_SOURCE_EXCLUDES = [
+  '**/*.test.ts',
+  '**/*.test.tsx',
+  '**/*.spec.ts',
+  '**/*.spec.tsx',
+  '**/__tests__/**',
+  '**/__mocks__/**',
+  '**/__fixtures__/**',
+  '**/*.bench.ts',
+  '**/*.benchmark.ts',
+  '**/benchmarks/**',
+  '**/runtime-tests/**',
+  '**/*.config.ts',
+  '**/*.config.js',
+  '**/*.config.mjs',
+  '**/*.config.cjs',
+  '.vitest.config/**',
+  '.storybook/**',
+  '*.stories.ts',
+  '*.stories.tsx',
+];
+
 // Loads .gitignore from the repo root and merges in StructX-specific defaults so
 // projects without a .gitignore still get sensible exclusions. Nested .gitignore
 // files are intentionally not loaded yet — root-level handling covers ~95% of
 // real-world cases without the complexity of per-directory rule stacks.
+//
+// Per-project overrides:
+//   .structxignore   — same syntax as .gitignore, applied AFTER defaults so
+//                      `!**/*.test.ts` re-enables test indexing for projects
+//                      that want it.
 function loadGitignore(rootPath: string): Ignore {
   const ig = ignore();
 
@@ -52,12 +89,27 @@ function loadGitignore(rootPath: string): Ignore {
   // doesn't try to ingest dist/ or coverage/.
   ig.add(['dist', 'build', 'out', '.next', 'coverage', '.cache']);
 
+  // Source-quality defaults — exclude tests, benchmarks, and config-as-code
+  // unless the user opts back in via .structxignore.
+  ig.add(DEFAULT_SOURCE_EXCLUDES);
+
   const gitignorePath = path.join(rootPath, '.gitignore');
   if (fs.existsSync(gitignorePath)) {
     try {
       ig.add(fs.readFileSync(gitignorePath, 'utf-8'));
     } catch {
       // unreadable .gitignore — fall through with defaults only
+    }
+  }
+
+  // Project-specific overrides — applied AFTER both defaults and .gitignore
+  // so users can re-enable test indexing with `!**/*.test.ts` etc.
+  const structxIgnorePath = path.join(rootPath, '.structxignore');
+  if (fs.existsSync(structxIgnorePath)) {
+    try {
+      ig.add(fs.readFileSync(structxIgnorePath, 'utf-8'));
+    } catch {
+      // unreadable .structxignore — silently ignore, defaults still apply
     }
   }
 

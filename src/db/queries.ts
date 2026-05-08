@@ -94,6 +94,18 @@ export function getFunctionsByName(db: Database.Database, name: string): Functio
   return db.prepare('SELECT * FROM functions WHERE name = ? ORDER BY file_id, start_line').all(name) as FunctionRow[];
 }
 
+// Match an unqualified function name (e.g. `add`) against qualified method
+// names (e.g. `RegExpRouter.add`). Used as a fallback by directLookup and
+// the LLM-backed ask flow when the user asks about a bare method name on
+// an OO codebase. Skips matches when the user already gave a qualified
+// name (e.g. `RegExpRouter.add` — they meant exactly that one).
+export function getFunctionsByUnqualifiedName(db: Database.Database, name: string): FunctionRow[] {
+  if (name.includes('.')) return [];
+  return db.prepare(
+    `SELECT * FROM functions WHERE name LIKE ? ESCAPE '\\' ORDER BY file_id, start_line`
+  ).all('%.' + name.replace(/[%_\\]/g, '\\$&')) as FunctionRow[];
+}
+
 // Resolve a callee name to a function id only when the name is unambiguous.
 // Returns null when zero or multiple functions share the name. This avoids
 // silently binding cross-file relationships to the wrong function during
@@ -641,7 +653,7 @@ export interface TypeRow {
   id: number;
   file_id: number;
   name: string;
-  kind: 'interface' | 'type_alias' | 'enum';
+  kind: 'interface' | 'type_alias' | 'enum' | 'class';
   full_text: string;
   is_exported: number;
   start_line: number;
@@ -653,7 +665,7 @@ export interface TypeRow {
 export interface InsertType {
   file_id: number;
   name: string;
-  kind: 'interface' | 'type_alias' | 'enum';
+  kind: 'interface' | 'type_alias' | 'enum' | 'class';
   full_text: string;
   is_exported: boolean;
   start_line: number;

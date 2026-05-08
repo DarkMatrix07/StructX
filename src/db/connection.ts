@@ -111,6 +111,52 @@ function runMigrations(db: Database.Database): void {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  migrateTypesKindConstraint(db);
+}
+
+// SQLite doesn't support ALTER TABLE to change a CHECK constraint, so for
+// the `types.kind` column we detect the old constraint (no `class`) and
+// rebuild the table with the new one. Idempotent — schemas that already
+// allow 'class' are left untouched. Runs once per `openDatabase` and is
+// fast (zero rows to copy unless the user actually has types indexed).
+function migrateTypesKindConstraint(db: Database.Database): void {
+  try {
+    const row = db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='types'`
+    ).get() as { sql: string } | undefined;
+    if (!row || row.sql.includes("'class'")) return;
+
+    db.exec('PRAGMA foreign_keys=OFF');
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE types_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('interface', 'type_alias', 'enum', 'class')),
+          full_text TEXT NOT NULL,
+          is_exported BOOLEAN DEFAULT 0,
+          start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL,
+          purpose TEXT,
+          semantic_analyzed_at DATETIME
+        )
+      `);
+      db.exec(`INSERT INTO types_new SELECT * FROM types`);
+      db.exec(`DROP TABLE types`);
+      db.exec(`ALTER TABLE types_new RENAME TO types`);
+    })();
+    db.exec('PRAGMA foreign_keys=ON');
+
+    // FTS index over the recreated table needs a rebuild — the old fts5
+    // virtual table tracked the old types rowids.
+    try { db.exec("INSERT INTO types_fts(types_fts) VALUES('rebuild')"); } catch {}
+  } catch {
+    // Best effort. If the migration fails, the worst case is users who
+    // haven't analyzed yet keep getting the old constraint; functions and
+    // routes are unaffected.
+  }
 }
 
 function normalizeExistingFilePaths(db: Database.Database): void {

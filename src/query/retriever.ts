@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import type { FunctionRow, TypeRow, RouteRow, ConstantRow, FileSummaryRow } from '../db/queries';
 import {
-  getFunctionByName, getFunctionsByName, getFunctionById, getCallees, getCallers, getCallersByName,
+  getFunctionByName, getFunctionsByName, getFunctionsByUnqualifiedName, getFunctionById, getCallees, getCallers, getCallersByName,
   searchFunctions, getTransitiveCallersRobust,
   getAllRoutes, searchRoutes, getRoutesByFileId,
   getTypesByName, searchTypes, getAllTypes,
@@ -121,8 +121,17 @@ function emptyContext(strategy: string): RetrievedContext {
 // preserve token-budget control for agents that just want signatures.
 // The CLI `ask` flow uses `directLookupExpanded` below to also pull in
 // callees so the answerer can reason about behavior, not just shape.
+//
+// Fuzzy fallback: if the name is unqualified (no dot) and an exact lookup
+// returns nothing, we also try matching against qualified method names —
+// e.g. `add` matches `RegExpRouter.add`, `LinearRouter.add`, etc. This
+// fixes a common dead-end on OO codebases where the user asks for a
+// method by its bare name without knowing which class it lives on.
 export function directLookup(db: Database.Database, name: string, opts: { includeBody?: boolean } = {}): RetrievedContext {
-  const fns = getFunctionsByName(db, name);
+  let fns = getFunctionsByName(db, name);
+  if (fns.length === 0) {
+    fns = getFunctionsByUnqualifiedName(db, name);
+  }
   if (fns.length === 0) {
     return emptyContext('direct');
   }
@@ -139,7 +148,10 @@ export function directLookup(db: Database.Database, name: string, opts: { includ
 // lives in its callees (e.g. searchTasks → listTasksByOwner is where the
 // soft-delete filter lives, not in searchTasks itself).
 export function directLookupExpanded(db: Database.Database, name: string): RetrievedContext {
-  const fns = getFunctionsByName(db, name);
+  let fns = getFunctionsByName(db, name);
+  if (fns.length === 0) {
+    fns = getFunctionsByUnqualifiedName(db, name);
+  }
   if (fns.length === 0) {
     return emptyContext('direct');
   }
@@ -192,7 +204,10 @@ export function relationshipQuery(
   name: string,
   direction: 'callers' | 'callees'
 ): RetrievedContext {
-  const matches = getFunctionsByName(db, name);
+  let matches = getFunctionsByName(db, name);
+  if (matches.length === 0) {
+    matches = getFunctionsByUnqualifiedName(db, name);
+  }
   if (matches.length === 0) {
     return emptyContext('relationship');
   }
@@ -286,7 +301,10 @@ export function domainQuery(db: Database.Database, domain: string): RetrievedCon
 }
 
 export function impactAnalysis(db: Database.Database, name: string): RetrievedContext {
-  const matches = getFunctionsByName(db, name);
+  let matches = getFunctionsByName(db, name);
+  if (matches.length === 0) {
+    matches = getFunctionsByUnqualifiedName(db, name);
+  }
   if (matches.length === 0) {
     return emptyContext('impact');
   }
