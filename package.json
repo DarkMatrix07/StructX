@@ -1,6 +1,6 @@
 {
   "name": "structx",
-  "version": "3.0.2",
+  "version": "3.1.0",
   "main": "dist/cli.js",
   "bin": {
     "structx": "dist/cli.js"
@@ -18,11 +18,26 @@
     "code-intelligence",
     "typescript",
     "ast",
-    "llm"
+    "llm",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "cursor",
+    "code-graph",
+    "ai-agent",
+    "rag"
   ],
-  "author": "",
+  "homepage": "https://github.com/DarkMatrix07/StructX#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DarkMatrix07/StructX.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DarkMatrix07/StructX/issues"
+  },
+  "author": "DarkMatrix07",
   "license": "ISC",
-  "description": "Graph-powered code intelligence CLI for TypeScript",
+  "description": "Graph-powered code intelligence for TypeScript. MCP server + CLI that gives AI agents (Claude, Cursor, Continue, Cline) a function-level knowledge graph of your codebase — millisecond-latency calls instead of grep + file reads.",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
     "@google/generative-ai": "^0.24.1",

@@ -18,7 +18,7 @@ export async function runMcpServer(defaultRepo: string, opts: RunMcpServerOption
   setReadonly(!!opts.readonly);
   const server = new McpServer({
     name: 'structx',
-    version: '3.0.2',
+    version: '3.1.0',
   });
 
   registerTools(server, defaultRepo);

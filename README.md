@@ -2,7 +2,9 @@
 
 **Graph-powered code intelligence for TypeScript.** Drop into any project and your AI agent (Claude Code, Cursor, Copilot, Continue, Cline) gets a function-level knowledge graph instead of grepping raw files. Queries that took several file reads collapse into a single millisecond-latency call.
 
-[![npm](https://img.shields.io/npm/v/structx.svg)](https://www.npmjs.com/package/structx)
+[![npm](https://img.shields.io/npm/v/structx.svg)](https://www.npmjs.com/package/structx) [![license](https://img.shields.io/npm/l/structx.svg)](#license) [![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)](#contributing)
+
+> **v3.1.0 just shipped — first release with the full MCP server (12 tools), watch mode, dead-code finder, streaming `ask`, and Gemini provider support.** See [CHANGELOG.md](./CHANGELOG.md) for the full diff from 3.0.x.
 
 ```
 agent: "what breaks if I change validateEmail?"
@@ -420,7 +422,7 @@ Watch mode end-to-end latency (file save → DB visible to readers): **~160 ms m
 
 ## Status
 
-**v3.0.x — published on npm, used in real projects.**
+**v3.1.0 — published on npm.**
 
 Strong:
 - 12 MCP tools, strict schemas, three providers, streaming, multi-repo, readonly
