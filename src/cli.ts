@@ -110,6 +110,7 @@ program
       let totalOutputTokens = 0;
       let totalCost = 0;
       let batchNum = 0;
+      let abortReason: string | undefined;
 
       while (true) {
         const pending = getPendingAnalysis(db, config.batchSize);
@@ -126,13 +127,36 @@ program
         totalInputTokens += batchResult.totalInputTokens;
         totalOutputTokens += batchResult.totalOutputTokens;
         totalCost += batchResult.totalCost;
+
+        // Stop the function-batch loop the first time the provider says
+        // we're out of credits / authentication failed. Without this, the
+        // CLI would burn time hammering an endpoint that will keep
+        // rejecting every call and report a confusing "Failed: N" total
+        // with no reason. Items are already marked `failed` in the DB
+        // and will re-enqueue on the next analyze run.
+        if (batchResult.aborted) {
+          abortReason = batchResult.abortReason;
+          break;
+        }
       }
 
-      // Analyze types, routes, and file summaries
-      console.log('\n  Analyzing types, routes, and file summaries...');
-      const typeResult = await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
-      const routeResult = await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
-      const fileResult = await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
+      // Analyze types, routes, and file summaries — but only if we didn't
+      // already hit a fatal provider error in the function loop above.
+      const typeResult = abortReason
+        ? { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 }
+        : await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+      const routeResult = abortReason || (typeResult as any).aborted
+        ? { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 }
+        : await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+      const fileResult = abortReason || (typeResult as any).aborted || (routeResult as any).aborted
+        ? { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 }
+        : await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
+      if (!abortReason) {
+        abortReason = (typeResult as any).abortReason ?? (routeResult as any).abortReason ?? (fileResult as any).abortReason;
+      }
+      if (!abortReason) {
+        console.log('\n  Analyzing types, routes, and file summaries...');
+      }
 
       totalAnalyzed += typeResult.analyzed + routeResult.analyzed + fileResult.analyzed;
       totalFailed += typeResult.failed + routeResult.failed + fileResult.failed;
@@ -152,6 +176,10 @@ program
       console.log(`  Input tokens:   ${totalInputTokens.toLocaleString()}`);
       console.log(`  Output tokens:  ${totalOutputTokens.toLocaleString()}`);
       console.log(`  Total cost:     $${totalCost.toFixed(4)}`);
+      if (abortReason) {
+        console.log(`\nAborted: ${abortReason}`);
+        console.log(`Failed items remain queued — re-run \`structx analyze .\` after fixing the issue.`);
+      }
     } else if (ingestResult.queued > 0) {
       console.log('\nSkipping analysis: ANTHROPIC_API_KEY not set.');
       console.log('Set the key and run "structx analyze . --yes" to enrich functions.');

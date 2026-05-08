@@ -35,6 +35,29 @@ export interface AnalyzeResult {
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCost: number;
+  // True when the LLM provider returned a fatal billing/auth error
+  // (e.g. 402 insufficient credits, 401 invalid key). Callers MUST stop
+  // the outer batch loop — there is no point in spending more time
+  // hammering an endpoint that will keep rejecting every call.
+  aborted?: boolean;
+  abortReason?: string;
+}
+
+// Detect provider errors that mean every subsequent call will also fail.
+// Battle-tested case: tRPC analyze on an out-of-credit OpenRouter key
+// emitted 1100 doomed requests before reporting "Failed: 1100" with no
+// actionable message. Now we trip the abort flag on the first 402/401
+// and the CLI surfaces the reason cleanly.
+export function isFatalProviderError(err: any): { fatal: boolean; reason: string } {
+  const status = err?.status ?? err?.code;
+  const message: string = err?.message ?? String(err ?? '');
+  if (status === 402 || /insufficient credits|payment required/i.test(message)) {
+    return { fatal: true, reason: 'Provider returned 402 — out of credits. Top up at the provider dashboard or switch providers in .structx/config.json.' };
+  }
+  if (status === 401 || /invalid api key|authentication/i.test(message)) {
+    return { fatal: true, reason: 'Provider authentication failed (401). Check the API key in .structx/config.json or env (ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY).' };
+  }
+  return { fatal: false, reason: '' };
 }
 
 export async function analyzeBatch(
@@ -134,6 +157,23 @@ export async function analyzeBatch(
     result.totalOutputTokens += outputTokens;
     result.totalCost += estimateCost(model, inputTokens, outputTokens);
   } catch (err: any) {
+    const fatal = isFatalProviderError(err);
+    if (fatal.fatal) {
+      // Don't keep retrying — every subsequent call hits the same wall.
+      // Mark this batch's items as failed so they re-enqueue on next run,
+      // signal abort to the CLI loop, and surface the actionable reason.
+      logger.error(fatal.reason);
+      for (const pf of uncachedFunctions) {
+        const mapping = functionMap.get(pf.function_name);
+        if (mapping) {
+          updateAnalysisStatus(db, mapping.queueId, 'failed');
+          result.failed++;
+        }
+      }
+      result.aborted = true;
+      result.abortReason = fatal.reason;
+      return result;
+    }
     logger.error(`LLM API call failed: ${err.message}`);
     for (const pf of uncachedFunctions) {
       const mapping = functionMap.get(pf.function_name);
@@ -227,6 +267,8 @@ export interface SimpleAnalyzeResult {
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCost: number;
+  aborted?: boolean;
+  abortReason?: string;
 }
 
 export async function analyzeTypes(
@@ -274,6 +316,14 @@ export async function analyzeTypes(
         }
       }
     } catch (err: any) {
+      const fatal = isFatalProviderError(err);
+      if (fatal.fatal) {
+        logger.error(fatal.reason);
+        result.failed += batch.length;
+        result.aborted = true;
+        result.abortReason = fatal.reason;
+        return result;
+      }
       logger.error(`Type analysis failed: ${err.message}`);
       result.failed += batch.length;
     }
@@ -323,6 +373,14 @@ export async function analyzeRoutes(
         }
       }
     } catch (err: any) {
+      const fatal = isFatalProviderError(err);
+      if (fatal.fatal) {
+        logger.error(fatal.reason);
+        result.failed += batch.length;
+        result.aborted = true;
+        result.abortReason = fatal.reason;
+        return result;
+      }
       logger.error(`Route analysis failed: ${err.message}`);
       result.failed += batch.length;
     }
@@ -386,6 +444,14 @@ export async function analyzeFileSummaries(
         }
       }
     } catch (err: any) {
+      const fatal = isFatalProviderError(err);
+      if (fatal.fatal) {
+        logger.error(fatal.reason);
+        result.failed += batch.length;
+        result.aborted = true;
+        result.abortReason = fatal.reason;
+        return result;
+      }
       logger.error(`File summary analysis failed: ${err.message}`);
       result.failed += batch.length;
     }

@@ -51,6 +51,7 @@ export function scanDirectory(rootPath: string): string[] {
 // can add `!**/*.test.ts` etc. to a `.structxignore` file or override via
 // config (see CONTRIBUTING for the override pattern).
 const DEFAULT_SOURCE_EXCLUDES = [
+  // Tests, fixtures, mocks
   '**/*.test.ts',
   '**/*.test.tsx',
   '**/*.spec.ts',
@@ -58,10 +59,14 @@ const DEFAULT_SOURCE_EXCLUDES = [
   '**/__tests__/**',
   '**/__mocks__/**',
   '**/__fixtures__/**',
+  '**/tests/**',
+  '**/test/**',
   '**/*.bench.ts',
   '**/*.benchmark.ts',
   '**/benchmarks/**',
   '**/runtime-tests/**',
+
+  // Config-as-code
   '**/*.config.ts',
   '**/*.config.js',
   '**/*.config.mjs',
@@ -70,7 +75,29 @@ const DEFAULT_SOURCE_EXCLUDES = [
   '.storybook/**',
   '*.stories.ts',
   '*.stories.tsx',
+
+  // Monorepo non-library paths — common conventions across Yarn / pnpm /
+  // Turbo / Nx / Lerna setups. Battle-tested on tRPC where these were
+  // 47% of the indexed files but represented demo apps and the docs site,
+  // not library source the agent should reason about. Users who DO want
+  // these indexed (e.g. they're working ON the demo app) can negate via
+  // `.structxignore` (e.g. `!examples/my-app/**`).
+  'examples/**',
+  'example/**',
+  'demo/**',
+  'demos/**',
+  'playground/**',
+  'playgrounds/**',
+  'www/**',
+  'website/**',
+  'docs-site/**',
+  'scripts/**',
+  'e2e/**',           // e2e test apps live alongside src in many setups
 ];
+// Note: `docs/`, `tools/`, `apps/` are intentionally NOT in defaults — they
+// can legitimately contain library source (e.g. Nx-style apps/, Effect-
+// style docs/ with real .ts examples). Users who want those excluded can
+// add them to `.structxignore`.
 
 // Loads .gitignore from the repo root and merges in StructX-specific defaults so
 // projects without a .gitignore still get sensible exclusions. Nested .gitignore

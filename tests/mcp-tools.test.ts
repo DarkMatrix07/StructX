@@ -145,6 +145,34 @@ describe('MCP graph tools', () => {
     expect(files).toEqual(['src/real.ts']);
   });
 
+  it('excludes monorepo non-library paths (examples/, www/, scripts/, tests/)', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Battle-tested case from tRPC: examples/ (264 files), www/ (52),
+    // packages/tests/ (~280) all polluted the production graph. Library
+    // code in packages/ should remain — every other top-level dir on
+    // this fixture should drop out.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-monorepo-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'packages', 'core', 'src'), { recursive: true });
+    mkdirSync(join(repo, 'examples', 'demo-app', 'src'), { recursive: true });
+    mkdirSync(join(repo, 'www', 'src'), { recursive: true });
+    mkdirSync(join(repo, 'scripts'), { recursive: true });
+    mkdirSync(join(repo, 'packages', 'tests', 'src'), { recursive: true });
+
+    writeFileSync(join(repo, 'packages', 'core', 'src', 'lib.ts'), `export function lib(): number { return 1; }`);
+    writeFileSync(join(repo, 'examples', 'demo-app', 'src', 'app.ts'), `export function demoApp(): number { return 2; }`);
+    writeFileSync(join(repo, 'www', 'src', 'index.ts'), `export function docsSite(): number { return 3; }`);
+    writeFileSync(join(repo, 'scripts', 'build.ts'), `export function buildScript(): number { return 4; }`);
+    writeFileSync(join(repo, 'packages', 'tests', 'src', 'helpers.ts'), `export function testHelper(): number { return 5; }`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const files = getAllFiles(db).map(f => f.path).sort();
+    db.close();
+
+    expect(files).toEqual(['packages/core/src/lib.ts']);
+  });
+
   it('honors .structxignore overrides to re-enable excluded files', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     // For projects that DO want to index tests (e.g. for coverage tooling
