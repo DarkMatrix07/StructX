@@ -113,6 +113,31 @@ function runMigrations(db: Database.Database): void {
   `);
 
   migrateTypesKindConstraint(db);
+
+  // type_relationships was added in v3.3.0. Old DBs migrate idempotently
+  // — schema.sql's CREATE IF NOT EXISTS already covers this on first
+  // open after upgrade, but we explicitly trip the FTS rebuild so the
+  // graph fingerprint changes (invalidating old ask cache) when users
+  // first see heritage edges in answers.
+  try {
+    const exists = db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='type_relationships'`
+    ).get();
+    if (!exists) {
+      db.exec(`
+        CREATE TABLE type_relationships (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          subtype_id INTEGER NOT NULL REFERENCES types(id) ON DELETE CASCADE,
+          supertype_id INTEGER REFERENCES types(id) ON DELETE SET NULL,
+          supertype_name TEXT NOT NULL,
+          relation_kind TEXT NOT NULL CHECK(relation_kind IN ('extends', 'implements'))
+        );
+        CREATE INDEX idx_type_relationships_subtype ON type_relationships(subtype_id);
+        CREATE INDEX idx_type_relationships_supertype_id ON type_relationships(supertype_id);
+        CREATE INDEX idx_type_relationships_supertype_name ON type_relationships(supertype_name);
+      `);
+    }
+  } catch {}
 }
 
 // SQLite doesn't support ALTER TABLE to change a CHECK constraint, so for

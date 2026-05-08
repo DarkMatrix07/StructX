@@ -4,7 +4,7 @@ import type Database from 'better-sqlite3';
 import { createProject } from '../ingest/parser';
 import { ingestSingleFile, removeFileFromGraph } from '../ingest/ingester';
 import { ALWAYS_SKIP_DIRS, loadIgnoreMatcher, isIngestableTsFile } from '../ingest/scanner';
-import { resolveNullCallees, rebuildAllFtsIndexes } from '../db/queries';
+import { resolveNullCallees, resolveTypeRelationships, rebuildAllFtsIndexes } from '../db/queries';
 import { logger } from '../utils/logger';
 
 interface WatchOptions {
@@ -122,6 +122,7 @@ export async function watchDirectory(
       // Single post-process for the whole batch.
       try {
         resolveNullCallees(db);
+        resolveTypeRelationships(db);
         rebuildAllFtsIndexes(db);
       } catch (err: any) {
         logger.warn(`Post-process failed: ${err.message}`);

@@ -1,9 +1,12 @@
 import { Project, SourceFile, SyntaxKind, Node, FunctionDeclaration, ArrowFunction, MethodDeclaration, VariableDeclaration } from 'ts-morph';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { extractTypes, type ExtractedType } from './type-extractor';
 import { extractRoutes, type ExtractedRoute } from './route-extractor';
 import { extractConstants, type ExtractedConstant } from './constant-extractor';
 import { extractFileMetadata, type ExtractedFileMetadata } from './file-metadata';
+import { logger } from '../utils/logger';
 
 export interface ExtractedFunction {
   name: string;
@@ -17,14 +20,157 @@ export interface ExtractedFunction {
 }
 
 export function createProject(repoPath: string): Project {
+  // Discover the most useful tsconfig in the repo. With its `paths` and
+  // `baseUrl`, ts-morph's TypeChecker can resolve cross-package imports
+  // like `import { RouteKey } from 'src/enum'` (immich-style) — which
+  // means decorator-arg enum members resolve to their literal values
+  // (`'assets'`) instead of falling back to the property-name heuristic
+  // (`'asset'`). The discovery happens once at project creation; we
+  // don't re-detect per-file.
+  const discovered = discoverTsconfig(repoPath);
+  const compilerOptions = {
+    allowJs: true,
+    jsx: 2, // React
+    ...(discovered?.paths ? { paths: discovered.paths } : {}),
+    ...(discovered?.baseUrl ? { baseUrl: discovered.baseUrl } : {}),
+  };
+  if (discovered) {
+    logger.debug(`Using tsconfig from ${discovered.tsconfigPath} (baseUrl: ${discovered.baseUrl ?? 'unset'})`);
+  }
   return new Project({
     tsConfigFilePath: undefined,
     skipAddingFilesFromTsConfig: true,
-    compilerOptions: {
-      allowJs: true,
-      jsx: 2, // React
-    },
+    compilerOptions,
   });
+}
+
+interface DiscoveredTsconfig {
+  tsconfigPath: string;
+  baseUrl?: string;          // resolved to absolute path
+  paths?: Record<string, string[]>;
+}
+
+// Walk the repo for a useful tsconfig.json. Strategy:
+//   1. If <repoRoot>/tsconfig.json exists, use it.
+//   2. Otherwise look at common workspace-root subdirs (server/, app/,
+//      packages/<single>/) — pick the one with the most TS files under it.
+//   3. Skip if no tsconfig found anywhere reasonable.
+//
+// We resolve relative `baseUrl` to an absolute path so ts-morph's path
+// matcher doesn't get confused by repoPath-vs-cwd differences.
+function discoverTsconfig(repoPath: string): DiscoveredTsconfig | null {
+  // Pass 1: root tsconfig
+  const rootTs = path.join(repoPath, 'tsconfig.json');
+  if (fs.existsSync(rootTs)) {
+    return readTsconfig(rootTs);
+  }
+
+  // Pass 2: walk the immediate subdirs and look for tsconfig.json one
+  // level deep. Common conventions: server/, app/, src/, packages/<X>/.
+  const candidates: Array<{ tsconfigPath: string; tsFiles: number }> = [];
+  const skipDirs = new Set(['node_modules', '.git', '.structx', '.claude']);
+
+  let firstLevel: string[] = [];
+  try {
+    firstLevel = fs.readdirSync(repoPath);
+  } catch {
+    return null;
+  }
+  for (const entry of firstLevel) {
+    if (skipDirs.has(entry)) continue;
+    const full = path.join(repoPath, entry);
+    let stat;
+    try { stat = fs.statSync(full); } catch { continue; }
+    if (!stat.isDirectory()) continue;
+
+    // Direct tsconfig.json inside this subdir.
+    const directTs = path.join(full, 'tsconfig.json');
+    if (fs.existsSync(directTs)) {
+      candidates.push({ tsconfigPath: directTs, tsFiles: countTsFiles(full) });
+      continue;
+    }
+    // Workspace pattern: packages/<package>/tsconfig.json — peek one deeper.
+    if (entry === 'packages' || entry === 'apps' || entry === 'libs') {
+      let inner: string[] = [];
+      try { inner = fs.readdirSync(full); } catch {}
+      for (const sub of inner) {
+        const subTs = path.join(full, sub, 'tsconfig.json');
+        if (fs.existsSync(subTs)) {
+          candidates.push({ tsconfigPath: subTs, tsFiles: countTsFiles(path.join(full, sub)) });
+        }
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.tsFiles - a.tsFiles);
+  return readTsconfig(candidates[0].tsconfigPath);
+}
+
+function countTsFiles(dir: string): number {
+  let n = 0;
+  const skipDirs = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next']);
+  function walk(d: string): void {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (skipDirs.has(e.name)) continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { walk(p); continue; }
+      if (e.isFile() && /\.(ts|tsx|js|jsx)$/.test(e.name) && !e.name.endsWith('.d.ts')) n++;
+    }
+  }
+  walk(dir);
+  return n;
+}
+
+// Parse just enough of a tsconfig to extract paths + baseUrl. We don't
+// pull in the whole TS compiler API — `JSON.parse` plus a few extends
+// follows handles every real-world case we've seen. JSONC comments are
+// tolerated via a simple stripping pass.
+function readTsconfig(tsconfigPath: string, depth = 0): DiscoveredTsconfig | null {
+  if (depth > 5) return null; // extends loops / very deep chains
+  let text: string;
+  try { text = fs.readFileSync(tsconfigPath, 'utf-8'); } catch { return null; }
+
+  // Strip JSONC comments + trailing commas — common in tsconfig files.
+  text = text.replace(/\/\*[\s\S]*?\*\//g, '');
+  text = text.replace(/(^|[^:])\/\/.*$/gm, '$1');
+  text = text.replace(/,(\s*[}\]])/g, '$1');
+
+  let parsed: any;
+  try { parsed = JSON.parse(text); } catch (err) {
+    logger.debug(`Failed to parse ${tsconfigPath}: ${(err as Error).message}`);
+    return null;
+  }
+
+  const tsconfigDir = path.dirname(tsconfigPath);
+  let baseUrl: string | undefined;
+  let paths: Record<string, string[]> | undefined;
+  let extendsConfig: DiscoveredTsconfig | null = null;
+
+  if (typeof parsed.extends === 'string') {
+    const extendedPath = path.isAbsolute(parsed.extends)
+      ? parsed.extends
+      : path.resolve(tsconfigDir, parsed.extends.endsWith('.json') ? parsed.extends : parsed.extends + '.json');
+    if (fs.existsSync(extendedPath)) {
+      extendsConfig = readTsconfig(extendedPath, depth + 1);
+    }
+  }
+
+  const co = parsed.compilerOptions ?? {};
+  if (typeof co.baseUrl === 'string') {
+    baseUrl = path.resolve(tsconfigDir, co.baseUrl);
+  } else if (extendsConfig?.baseUrl) {
+    baseUrl = extendsConfig.baseUrl;
+  }
+  if (co.paths && typeof co.paths === 'object') {
+    paths = co.paths as Record<string, string[]>;
+  } else if (extendsConfig?.paths) {
+    paths = extendsConfig.paths;
+  }
+
+  return { tsconfigPath, baseUrl, paths };
 }
 
 export function parseFile(project: Project, filePath: string): ExtractedFunction[] {

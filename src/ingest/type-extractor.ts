@@ -1,4 +1,4 @@
-import { SourceFile } from 'ts-morph';
+import { SourceFile, SyntaxKind } from 'ts-morph';
 
 export interface ExtractedType {
   name: string;
@@ -7,6 +7,10 @@ export interface ExtractedType {
   isExported: boolean;
   startLine: number;
   endLine: number;
+  // Heritage edges captured from `extends X, Y` and `implements A, B`.
+  // Names are stored bare (without generic args); the second-pass resolver
+  // in resolveNullCallees binds them to types.id when possible.
+  heritage?: Array<{ name: string; kind: 'extends' | 'implements' }>;
 }
 
 export function extractTypes(sourceFile: SourceFile): ExtractedType[] {
@@ -15,6 +19,12 @@ export function extractTypes(sourceFile: SourceFile): ExtractedType[] {
   for (const iface of sourceFile.getInterfaces()) {
     const name = iface.getName();
     if (!name) continue;
+    // Interfaces only have `extends` (multiple supertypes possible).
+    const heritage: Array<{ name: string; kind: 'extends' | 'implements' }> = [];
+    for (const ext of iface.getExtends()) {
+      const supertypeName = baseHeritageName(ext.getText());
+      if (supertypeName) heritage.push({ name: supertypeName, kind: 'extends' });
+    }
     types.push({
       name,
       kind: 'interface',
@@ -22,6 +32,7 @@ export function extractTypes(sourceFile: SourceFile): ExtractedType[] {
       isExported: iface.isExported(),
       startLine: iface.getStartLineNumber(),
       endLine: iface.getEndLineNumber(),
+      ...(heritage.length > 0 ? { heritage } : {}),
     });
   }
 
@@ -60,8 +71,22 @@ export function extractTypes(sourceFile: SourceFile): ExtractedType[] {
   for (const classDecl of sourceFile.getClasses()) {
     const name = classDecl.getName();
     if (!name) continue;
-    const heritage = classDecl.getHeritageClauses().map(h => h.getText()).join(' ');
-    const sig = `class ${name}${heritage ? ' ' + heritage : ''}`;
+    const heritageClauses = classDecl.getHeritageClauses();
+    const heritageText = heritageClauses.map(h => h.getText()).join(' ');
+    const sig = `class ${name}${heritageText ? ' ' + heritageText : ''}`;
+
+    // Capture each parent type as a separate edge so type-graph queries
+    // (e.g. "what classes extend Foo?") work on individual supertypes.
+    const heritage: Array<{ name: string; kind: 'extends' | 'implements' }> = [];
+    for (const clause of heritageClauses) {
+      const isExtends = clause.getToken() === SyntaxKind.ExtendsKeyword;
+      const kind: 'extends' | 'implements' = isExtends ? 'extends' : 'implements';
+      for (const typeNode of clause.getTypeNodes()) {
+        const supertypeName = baseHeritageName(typeNode.getText());
+        if (supertypeName) heritage.push({ name: supertypeName, kind });
+      }
+    }
+
     types.push({
       name,
       kind: 'class',
@@ -69,8 +94,23 @@ export function extractTypes(sourceFile: SourceFile): ExtractedType[] {
       isExported: classDecl.isExported(),
       startLine: classDecl.getStartLineNumber(),
       endLine: classDecl.getEndLineNumber(),
+      ...(heritage.length > 0 ? { heritage } : {}),
     });
   }
 
   return types;
+}
+
+// Strip generic arguments and dotted access from a heritage expression so
+// `extends Foo<T>` and `extends ns.Foo<T, U>` both reduce to `Foo`. Allows
+// the type-graph resolver to bind to the actual type by simple name.
+function baseHeritageName(text: string): string | null {
+  // Remove anything after `<` (generics) and trim whitespace.
+  let stripped = text.replace(/<[\s\S]*$/, '').trim();
+  // For `ns.Foo`, take the last segment.
+  const dotIdx = stripped.lastIndexOf('.');
+  if (dotIdx >= 0) stripped = stripped.slice(dotIdx + 1);
+  // Bare identifier check.
+  if (!/^[A-Za-z_$][\w$]*$/.test(stripped)) return null;
+  return stripped;
 }

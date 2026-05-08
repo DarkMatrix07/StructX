@@ -6,7 +6,7 @@ import {
   upsertFile, getFileByPath, insertFunction, getFunctionsByFileId,
   deleteFunctionsByFileId, deleteRelationshipsByCallerFunctionId,
   insertRelationship, resolveUniqueCalleeFunctionId, enqueueForAnalysis,
-  resolveNullCallees, rebuildAllFtsIndexes,
+  resolveNullCallees, resolveTypeRelationships, rebuildAllFtsIndexes,
   copySemanticFields,
   insertType, deleteTypesByFileId,
   insertRoute, deleteRoutesByFileId,
@@ -108,6 +108,7 @@ export function ingestSingleFile(
       insertType(db, {
         file_id: fileId, name: t.name, kind: t.kind, full_text: t.fullText,
         is_exported: t.isExported, start_line: t.startLine, end_line: t.endLine,
+        ...(t.heritage ? { heritage: t.heritage } : {}),
       });
       counts.types++;
     }
@@ -236,10 +237,16 @@ export function ingestDirectory(
     result.queued += fileResult.queued;
   }
 
-  // Second-pass: resolve NULL callee_function_ids and rebuild all FTS indexes
+  // Second-pass: resolve NULL callee_function_ids, type heritage, then
+  // rebuild all FTS indexes. Type heritage runs after types are inserted
+  // so cross-file `class X extends Y` edges bind correctly.
   const resolvedCount = resolveNullCallees(db);
   if (resolvedCount > 0) {
     logger.info(`Resolved ${resolvedCount} NULL callee_function_id(s)`);
+  }
+  const typeRelCount = resolveTypeRelationships(db);
+  if (typeRelCount > 0) {
+    logger.info(`Resolved ${typeRelCount} type heritage edge(s)`);
   }
   rebuildAllFtsIndexes(db);
 

@@ -427,6 +427,119 @@ export function consumer(): number {
     expect(callers.functions.map(fn => fn.name)).toContain('consumer');
   });
 
+  it('captures class extends + interface extends + class implements as type heritage', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-type-graph-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'shapes.ts'), `
+export interface Repository<T> { find(id: string): T | undefined; }
+export interface CachedRepository<T> extends Repository<T> { cache(): void; }
+export abstract class BaseService { abstract run(): void; }
+export class UserService extends BaseService implements Repository<unknown> {
+  run(): void {}
+  find(id: string): unknown { return undefined; }
+}
+export class TaskService extends BaseService implements Repository<unknown> {
+  run(): void {}
+  find(id: string): unknown { return undefined; }
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    // What classes implement Repository?
+    const repoSubtypes = (db.prepare(`
+      SELECT t.name, tr.relation_kind FROM type_relationships tr
+      JOIN types t ON t.id = tr.subtype_id
+      WHERE tr.supertype_name = 'Repository'
+      ORDER BY t.name
+    `).all() as Array<{ name: string; relation_kind: string }>);
+    expect(repoSubtypes.map(s => `${s.name} (${s.relation_kind})`)).toEqual([
+      'CachedRepository (extends)',
+      'TaskService (implements)',
+      'UserService (implements)',
+    ]);
+
+    // What does UserService extend / implement?
+    const userServiceParents = (db.prepare(`
+      SELECT tr.supertype_name, tr.relation_kind FROM type_relationships tr
+      JOIN types t ON t.id = tr.subtype_id
+      WHERE t.name = 'UserService'
+      ORDER BY tr.relation_kind, tr.supertype_name
+    `).all() as Array<{ supertype_name: string; relation_kind: string }>);
+    expect(userServiceParents.map(p => `${p.relation_kind} ${p.supertype_name}`)).toEqual([
+      'extends BaseService',
+      'implements Repository',
+    ]);
+
+    db.close();
+  });
+
+  it('extracts Web Component custom-element registrations as COMPONENT routes', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const repo = mkdtempSync(join(tmpdir(), 'structx-wc-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'wc.ts'), `
+function Component(opts: { tag: string }): ClassDecorator { return () => {}; }
+function customElement(tag: string): ClassDecorator { return () => {}; }
+
+@Component({ tag: 'my-counter' })
+export class MyCounter {}
+
+@customElement('my-button')
+export class MyButton {}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const routes = listQuery(db, 'routes').routes
+      .filter(r => r.method === 'COMPONENT')
+      .map(r => `${r.path} ${r.handlerName}`)
+      .sort();
+    db.close();
+
+    expect(routes).toEqual([
+      '/my-button MyButton',
+      '/my-counter MyCounter',
+    ]);
+  });
+
+  it('resolves path-aliased imports via tsconfig for decorator enum args', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Real-world case from immich: `@Controller(RouteKey.Asset)` with
+    // `import { RouteKey } from 'src/enum'` — path alias requires
+    // tsconfig for ts-morph's TypeChecker to follow. Without the
+    // tsconfig discovery added in v3.3, this falls back to the
+    // property-name heuristic ('asset' instead of 'assets').
+    const repo = mkdtempSync(join(tmpdir(), 'structx-path-alias-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src', 'enum'), { recursive: true });
+    writeFileSync(join(repo, 'tsconfig.json'), JSON.stringify({
+      compilerOptions: { baseUrl: './src', paths: { 'src/*': ['./*'] } },
+    }));
+    writeFileSync(join(repo, 'src', 'enum', 'route-key.ts'), `
+export enum RouteKey { Asset = 'assets', User = 'users' }
+`);
+    writeFileSync(join(repo, 'src', 'controller.ts'), `
+import { RouteKey } from 'src/enum/route-key';
+function Controller(p: any): ClassDecorator { return () => {}; }
+function Get(p?: string): MethodDecorator { return () => {}; }
+@Controller(RouteKey.Asset)
+export class AssetController { @Get(':id') findOne() {} }
+`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const routes = listQuery(db, 'routes').routes.map(r => r.path).sort();
+    db.close();
+
+    // Plural form ('assets') means the enum literal value resolved.
+    // Without tsconfig support this would fall back to '/asset/:id'.
+    expect(routes).toContain('/assets/:id');
+  });
+
   it('resolves enum-member arguments in @Controller decorators', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     // Real-world case from immich: all 40 controllers use
@@ -762,6 +875,7 @@ export function authorize(role: string): boolean {
         'structx_route',
         'structx_search',
         'structx_type',
+        'structx_type_graph',
       ]);
       const functionSchema = listed.tools.find(t => t.name === 'structx_function')?.inputSchema;
       expect(functionSchema?.properties).toHaveProperty('include_body');

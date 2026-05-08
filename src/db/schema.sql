@@ -88,6 +88,23 @@ CREATE TABLE IF NOT EXISTS types (
   semantic_analyzed_at DATETIME
 );
 
+-- Type-graph relationships: class extends Y, class implements Y, interface
+-- extends Y. Stored separately from function call relationships because the
+-- shape and query patterns are different (refactor questions vs blast-radius).
+-- The supertype is recorded by NAME so we can store edges before all types
+-- are ingested. A second-pass resolver binds supertype_id when the parent
+-- type is in the graph.
+CREATE TABLE IF NOT EXISTS type_relationships (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  subtype_id INTEGER NOT NULL REFERENCES types(id) ON DELETE CASCADE,
+  supertype_id INTEGER REFERENCES types(id) ON DELETE SET NULL,
+  supertype_name TEXT NOT NULL,
+  relation_kind TEXT NOT NULL CHECK(relation_kind IN ('extends', 'implements'))
+);
+CREATE INDEX IF NOT EXISTS idx_type_relationships_subtype ON type_relationships(subtype_id);
+CREATE INDEX IF NOT EXISTS idx_type_relationships_supertype_id ON type_relationships(supertype_id);
+CREATE INDEX IF NOT EXISTS idx_type_relationships_supertype_name ON type_relationships(supertype_name);
+
 CREATE TABLE IF NOT EXISTS routes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,

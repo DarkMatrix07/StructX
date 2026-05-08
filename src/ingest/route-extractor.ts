@@ -83,9 +83,67 @@ export function extractRoutes(sourceFile: SourceFile): ExtractedRoute[] {
   // Decorator-based routes (NestJS @Controller / @Get / @Post / etc.)
   for (const classDecl of sourceFile.getClasses()) {
     routes.push(...extractDecoratorRoutes(classDecl));
+    routes.push(...extractWebComponents(classDecl));
   }
 
   return routes;
+}
+
+// Web Component custom-element registrations. Stencil:
+//   @Component({ tag: 'my-counter' })
+//   class MyCounter {}
+// Lit:
+//   @customElement('my-element')
+//   class MyElement extends LitElement {}
+//
+// We surface these as routes with method='COMPONENT' so they show up in
+// structx_list / structx_route alongside HTTP routes — they're conceptually
+// the entry points of a UI codebase, the same way HTTP routes are entry
+// points for an API. Users who want UI-only tooling can filter by method.
+function extractWebComponents(classDecl: ClassDeclaration): ExtractedRoute[] {
+  const result: ExtractedRoute[] = [];
+  for (const dec of classDecl.getDecorators()) {
+    const name = dec.getName();
+    let tag: string | undefined;
+
+    if (name === 'Component') {
+      // Stencil / Angular-style: @Component({ tag: 'foo' }) — read the
+      // object literal's `tag` (or `selector`) property. Angular uses
+      // `selector`, Stencil uses `tag`.
+      const callExpr = dec.getCallExpression();
+      if (!callExpr) continue;
+      const args = callExpr.getArguments();
+      const arg = args[0];
+      if (!arg || !Node.isObjectLiteralExpression(arg)) continue;
+      for (const prop of arg.getProperties()) {
+        if (!Node.isPropertyAssignment(prop)) continue;
+        const propName = prop.getName();
+        if (propName !== 'tag' && propName !== 'selector') continue;
+        const initializer = prop.getInitializer();
+        if (initializer && Node.isStringLiteral(initializer)) {
+          tag = initializer.getLiteralValue();
+        } else if (initializer && Node.isNoSubstitutionTemplateLiteral(initializer)) {
+          tag = initializer.getLiteralValue();
+        }
+        if (tag) break;
+      }
+    } else if (name === 'customElement') {
+      // Lit-style: @customElement('foo')
+      tag = readDecoratorStringArg(dec);
+    }
+
+    if (!tag) continue;
+    result.push({
+      method: 'COMPONENT',
+      path: `/${tag}`,
+      handlerName: classDecl.getName() ?? null,
+      handlerBody: '',
+      middleware: null,
+      startLine: classDecl.getStartLineNumber(),
+      endLine: classDecl.getEndLineNumber(),
+    });
+  }
+  return result;
 }
 
 // Pull route definitions from a class with NestJS-style decorators:

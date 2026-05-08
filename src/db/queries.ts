@@ -701,6 +701,15 @@ export interface InsertType {
   is_exported: boolean;
   start_line: number;
   end_line: number;
+  heritage?: Array<{ name: string; kind: 'extends' | 'implements' }>;
+}
+
+export interface TypeRelationshipRow {
+  id: number;
+  subtype_id: number;
+  supertype_id: number | null;
+  supertype_name: string;
+  relation_kind: 'extends' | 'implements';
 }
 
 export function insertType(db: Database.Database, t: InsertType): number {
@@ -708,7 +717,76 @@ export function insertType(db: Database.Database, t: InsertType): number {
     INSERT INTO types (file_id, name, kind, full_text, is_exported, start_line, end_line)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(t.file_id, t.name, t.kind, t.full_text, t.is_exported ? 1 : 0, t.start_line, t.end_line);
-  return Number(result.lastInsertRowid);
+  const subtypeId = Number(result.lastInsertRowid);
+
+  // Heritage edges — supertype_id starts as NULL; resolveNullCallees has a
+  // sibling pass that binds it once all types are inserted.
+  if (t.heritage && t.heritage.length > 0) {
+    const stmt = db.prepare(`
+      INSERT INTO type_relationships (subtype_id, supertype_id, supertype_name, relation_kind)
+      VALUES (?, NULL, ?, ?)
+    `);
+    for (const edge of t.heritage) {
+      stmt.run(subtypeId, edge.name, edge.kind);
+    }
+  }
+
+  return subtypeId;
+}
+
+// ── Type-graph queries ──
+
+// Resolve supertype_id for type_relationships rows where it's NULL. Same
+// "exactly-one match" rule as resolveNullCallees so ambiguous names don't
+// produce false positives. Called from the post-ingest second pass.
+export function resolveTypeRelationships(db: Database.Database): number {
+  // Some legacy DBs may not have the type_relationships table yet — no-op
+  // gracefully for them; the migration in connection.ts will pick this up
+  // on next open.
+  try {
+    const result = db.prepare(`
+      UPDATE type_relationships SET supertype_id = (
+        SELECT t.id FROM types t WHERE t.name = type_relationships.supertype_name LIMIT 1
+      ) WHERE supertype_id IS NULL
+        AND (SELECT COUNT(*) FROM types t WHERE t.name = type_relationships.supertype_name) = 1
+    `).run();
+    return result.changes;
+  } catch {
+    return 0;
+  }
+}
+
+// Subtypes of a given supertype name — "what classes extend Foo?" /
+// "what implements Repository?". Returns both resolved (by id) and
+// unresolved (by name) edges so callers see inheritance even from types
+// outside the indexed graph.
+export function getSubtypesOf(db: Database.Database, supertypeName: string): Array<TypeRow & { relation_kind: 'extends' | 'implements' }> {
+  try {
+    return db.prepare(`
+      SELECT t.*, tr.relation_kind
+        FROM types t
+        JOIN type_relationships tr ON tr.subtype_id = t.id
+       WHERE tr.supertype_name = ?
+       ORDER BY t.kind, t.name
+    `).all(supertypeName) as Array<TypeRow & { relation_kind: 'extends' | 'implements' }>;
+  } catch {
+    return [];
+  }
+}
+
+// Supertypes of a given subtype — "what does Foo extend / implement?".
+export function getSupertypesOf(db: Database.Database, subtypeName: string): Array<{ name: string; relation_kind: 'extends' | 'implements'; resolvedTypeId: number | null }> {
+  try {
+    return db.prepare(`
+      SELECT tr.supertype_name as name, tr.relation_kind, tr.supertype_id as resolvedTypeId
+        FROM type_relationships tr
+        JOIN types t ON tr.subtype_id = t.id
+       WHERE t.name = ?
+       ORDER BY tr.relation_kind, tr.supertype_name
+    `).all(subtypeName) as Array<{ name: string; relation_kind: 'extends' | 'implements'; resolvedTypeId: number | null }>;
+  } catch {
+    return [];
+  }
 }
 
 export function getTypeByName(db: Database.Database, name: string): TypeRow | undefined {

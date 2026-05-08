@@ -9,6 +9,7 @@ import {
   getStats, getFullOverview,
   getCachedAskResponse, insertCachedAskResponse, insertQaRun,
   getFunctionsByName, getCostStats, getDeadFunctions,
+  getSubtypesOf, getSupertypesOf,
 } from '../db/queries';
 import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
@@ -111,6 +112,12 @@ const DeadCodeArgs = z.object({
 }).strict();
 const PrImpactArgs = z.object({
   ref: z.string().describe('Git ref to diff against. Common: "HEAD~1" (last commit), "main" (PR base), "<sha>" (specific commit).'),
+  response_mode: ResponseMode,
+  repo_path: RepoPath,
+}).strict();
+const TypeGraphArgs = z.object({
+  name: z.string().describe('Type name (interface / class / type alias).'),
+  direction: z.enum(['subtypes', 'supertypes']).describe('subtypes = "what extends/implements this type"; supertypes = "what does this type extend/implement".'),
   response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
@@ -604,7 +611,39 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     return toolResponse(lines.join('\n'), { dead: filtered, exported, internal }, args.response_mode);
   }));
 
-  // ── 12. structx_pr_impact ─────────────────────────────────────────────
+  // ── 12. structx_type_graph ─────────────────────────────────────────────
+  server.registerTool('structx_type_graph', {
+    description: 'Walk type heritage edges (extends / implements). direction="subtypes" finds classes/interfaces that extend or implement the given type; direction="supertypes" returns the parents of the given type. Closes the type-shaped refactor question gap (e.g. "what classes implement Repository?").',
+    inputSchema: TypeGraphArgs,
+  }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
+    if (args.direction === 'subtypes') {
+      const subs = getSubtypesOf(db, args.name);
+      const lines: string[] = [`# Subtypes of \`${args.name}\``, ''];
+      if (subs.length === 0) lines.push(`_No types extend or implement ${args.name} in the indexed graph._`);
+      const extendsList = subs.filter((s: any) => s.relation_kind === 'extends');
+      const implementsList = subs.filter((s: any) => s.relation_kind === 'implements');
+      if (extendsList.length > 0) {
+        lines.push('## extends');
+        for (const s of extendsList) lines.push(`- **${s.kind} ${s.name}** \`file_id:${s.file_id}:${s.start_line}\``);
+      }
+      if (implementsList.length > 0) {
+        lines.push('', '## implements');
+        for (const s of implementsList) lines.push(`- **${s.kind} ${s.name}** \`file_id:${s.file_id}:${s.start_line}\``);
+      }
+      return toolResponse(lines.join('\n'), { name: args.name, direction: 'subtypes', subtypes: subs }, args.response_mode);
+    }
+
+    const sups = getSupertypesOf(db, args.name);
+    const lines: string[] = [`# Supertypes of \`${args.name}\``, ''];
+    if (sups.length === 0) lines.push(`_${args.name} does not extend or implement any type in the indexed graph._`);
+    for (const s of sups) {
+      const resolved = s.resolvedTypeId !== null ? '' : ' _(unresolved — type lives outside the indexed graph)_';
+      lines.push(`- **${s.relation_kind} ${s.name}**${resolved}`);
+    }
+    return toolResponse(lines.join('\n'), { name: args.name, direction: 'supertypes', supertypes: sups }, args.response_mode);
+  }));
+
+  // ── 13. structx_pr_impact ─────────────────────────────────────────────
   server.registerTool('structx_pr_impact', {
     description: 'Map files changed since a git ref to indexed graph entities (functions, types, routes). Combine with structx_impact for transitive blast radius. Useful for "what does this PR actually touch" answers.',
     inputSchema: PrImpactArgs,
@@ -654,7 +693,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     return toolResponse(lines.join('\n'), result, args.response_mode);
   }));
 
-  // ── 13. structx_ask ────────────────────────────────────────────────────
+  // ── 14. structx_ask ────────────────────────────────────────────────────
   server.registerTool('structx_ask', {
     description: readonly
       ? 'DISABLED in readonly mode. structx_ask writes to ask_cache and qa_runs. Restart the server without --readonly to enable.'

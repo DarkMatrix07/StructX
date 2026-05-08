@@ -2,6 +2,68 @@
 
 All notable changes to StructX. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.3.0] — 2026-05-08
+
+Closes the three remaining "deferred / known limitation" items from
+v3.2.0. All three were noted in the v3.2.0 release notes as follow-ups;
+this release ships them.
+
+### Added
+
+#### Tsconfig path resolution
+
+When the repo has a `tsconfig.json` with `paths` and `baseUrl`, StructX
+now reads it and configures ts-morph's TypeChecker accordingly.
+Concretely, `import { RouteKey } from 'src/enum'` (path-aliased) now
+resolves correctly during `@Controller(RouteKey.Asset)` argument
+extraction — producing `/assets/:id` (the real enum value) instead of
+falling back to the `/asset/:id` heuristic. The discovery walks:
+
+  1. `<repo>/tsconfig.json`
+  2. otherwise the most-populated direct subdir's tsconfig
+     (`server/tsconfig.json`, `app/tsconfig.json`, etc.)
+  3. monorepo `packages/<X>/tsconfig.json` files, picking the one
+     covering the most TS files
+
+JSONC comments and `extends` chains (depth ≤ 5) are tolerated.
+Verified end-to-end on a synthetic immich-style fixture: enum literal
+values resolve through path-aliased imports.
+
+#### Type-graph relationships
+
+New `type_relationships` table tracks `class extends Y`, `class
+implements Z`, and `interface extends Y` edges. Stored by name so
+edges record before all types are ingested; a second-pass resolver
+binds `supertype_id` when the parent type is in the graph (mirroring
+the function-call resolver pattern).
+
+New `structx_type_graph` MCP tool answers refactor-shaped questions
+that the call graph couldn't:
+
+  - `direction: "subtypes"` — "what classes extend Foo? what
+    implements Repository?"
+  - `direction: "supertypes"` — "what does UserService extend / implement?"
+
+Schema migrated automatically on `openDatabase` for existing DBs.
+**14 MCP tools now** (was 13).
+
+#### Web Component custom elements
+
+Stencil `@Component({ tag: 'my-counter' })` (and `selector`-style
+Angular variants) plus Lit `@customElement('my-element')` decorators
+are extracted as routes with method `COMPONENT` and path equal to
+the registered tag (`/my-counter`). Lets the agent answer "what
+custom elements does this codebase register?" via the existing
+`structx_list { entity: 'routes' }` and `structx_route` tools.
+
+### Tests
+
+77 passing across 17 files (was 74 in `96c2c8f`).
+- `captures class extends + interface extends + class implements as type heritage`
+- `extracts Web Component custom-element registrations as COMPONENT routes`
+- `resolves path-aliased imports via tsconfig for decorator enum args`
+- updated tools/list test for the new `structx_type_graph` tool
+
 ## [3.2.0] — 2026-05-08
 
 Major capability release. Closes the four largest functional gaps from
