@@ -376,6 +376,47 @@ export function consumer(): number {
     expect(callers.functions.map(fn => fn.name)).toContain('consumer');
   });
 
+  it('resolves enum-member arguments in @Controller decorators', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Real-world case from immich: all 40 controllers use
+    // `@Controller(RouteKey.Asset)` style enum references instead of
+    // string literals. When ts-morph can resolve the enum (same-folder
+    // import, no tsconfig path aliases), we get the real value
+    // (`'assets'`); otherwise the property name is used as a heuristic.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-enum-decorator-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'enum.ts'), `
+export enum RouteKey {
+  Asset = 'assets',
+  User = 'users',
+}
+`);
+    writeFileSync(join(repo, 'src', 'controllers.ts'), `
+import { RouteKey } from './enum';
+function Controller(p: any): ClassDecorator { return () => {}; }
+function Get(p?: string): MethodDecorator { return () => {}; }
+
+@Controller(RouteKey.Asset)
+export class AssetController {
+  @Get(':id') findOne() {}
+}
+
+@Controller(RouteKey.User)
+export class UserController {
+  @Get('me') me() {}
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const routes = listQuery(db, 'routes').routes.map(r => `${r.method} ${r.path}`).sort();
+    db.close();
+
+    // Same-folder import means ts-morph resolves the literal enum values.
+    expect(routes).toContain('GET /assets/:id');
+    expect(routes).toContain('GET /users/me');
+  });
+
   it('extracts decorator-style routes (NestJS @Controller + @Get/@Post)', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const repo = mkdtempSync(join(tmpdir(), 'structx-decorator-routes-test-'));

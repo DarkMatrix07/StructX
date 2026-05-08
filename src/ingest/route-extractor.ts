@@ -159,8 +159,38 @@ function readDecoratorStringArg(dec: import('ts-morph').Decorator): string | und
   if (Node.isStringLiteral(first)) return first.getLiteralValue();
   // Template literals without interpolation are treated as static paths.
   if (Node.isNoSubstitutionTemplateLiteral(first)) return first.getLiteralValue();
-  // Variable / interpolated path — we can't statically resolve. Skip the
-  // decorator-arg case; the route will inherit just the base path.
+
+  // Enum member reference — `@Controller(RouteKey.Asset)`. Real-world case
+  // from immich: all 40 controllers use `@Controller(RouteKey.X)` instead
+  // of a string literal. ts-morph's TypeChecker resolves the enum member
+  // to its literal value (`'assets'`) for string enums when the project
+  // has full visibility into the enum's source file. When type resolution
+  // fails (e.g. path-aliased imports the project couldn't follow because
+  // it has no tsconfig), we fall back to the property identifier itself
+  // so each controller still produces a distinct, recognizable route
+  // path (`/Asset/...`) instead of all collapsing to `/`.
+  try {
+    const type = first.getType();
+    const literal = type.getLiteralValue();
+    if (typeof literal === 'string') return literal;
+    if (typeof literal === 'number') return String(literal);
+  } catch {
+    // Fall through to the heuristic below — never crash the ingest just
+    // because the type checker couldn't resolve a single decorator arg.
+  }
+  if (Node.isPropertyAccessExpression(first)) {
+    const memberName = first.getName();
+    if (memberName) {
+      // Lowercase to match the common enum-to-route convention
+      // (`RouteKey.Asset` → `'assets'` in production, `Asset` → `asset`
+      // as our heuristic). Not always identical to the real value, but
+      // produces distinct, agent-readable paths per controller — which
+      // is much better than every route collapsing to `/`.
+      return memberName.toLowerCase();
+    }
+  }
+  // Variable / interpolated / non-resolvable path — skip the decorator-arg
+  // case so the route inherits just the base path (or empty).
   return undefined;
 }
 
