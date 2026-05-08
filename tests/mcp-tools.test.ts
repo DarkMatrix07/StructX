@@ -173,6 +173,35 @@ describe('MCP graph tools', () => {
     expect(files).toEqual(['packages/core/src/lib.ts']);
   });
 
+  it('excludes nested e2e/ and sample/ directories at any depth', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Battle-tested case from NestJS: 18 fake "routes" came from
+    // `integration/hello-world/e2e/...`, `sample/01-cats-app/e2e/...`,
+    // and `sample/N-foo/e2e/...spec.ts`. Top-level-only patterns (e2e/**)
+    // don't catch these — the patterns must be recursive (**/e2e/**).
+    const repo = mkdtempSync(join(tmpdir(), 'structx-nested-excludes-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'packages', 'core', 'src'), { recursive: true });
+    mkdirSync(join(repo, 'packages', 'core', 'e2e'), { recursive: true });
+    mkdirSync(join(repo, 'sample', '01-cats-app', 'src'), { recursive: true });
+    mkdirSync(join(repo, 'integration', 'hello-world', 'e2e'), { recursive: true });
+    mkdirSync(join(repo, 'src', 'examples'), { recursive: true });
+
+    writeFileSync(join(repo, 'packages', 'core', 'src', 'lib.ts'), `export function lib(): number { return 1; }`);
+    writeFileSync(join(repo, 'packages', 'core', 'e2e', 'spec.ts'), `export function nestedE2E(): number { return 2; }`);
+    writeFileSync(join(repo, 'sample', '01-cats-app', 'src', 'app.ts'), `export function sample(): number { return 3; }`);
+    writeFileSync(join(repo, 'integration', 'hello-world', 'e2e', 'middleware.ts'), `export function deepE2E(): number { return 4; }`);
+    writeFileSync(join(repo, 'src', 'examples', 'usage.ts'), `export function srcExample(): number { return 5; }`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const files = getAllFiles(db).map(f => f.path).sort();
+    db.close();
+
+    // Only the legitimate library file survives.
+    expect(files).toEqual(['packages/core/src/lib.ts']);
+  });
+
   it('honors .structxignore overrides to re-enable excluded files', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     // For projects that DO want to index tests (e.g. for coverage tooling

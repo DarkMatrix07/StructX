@@ -82,17 +82,21 @@ const DEFAULT_SOURCE_EXCLUDES = [
   // not library source the agent should reason about. Users who DO want
   // these indexed (e.g. they're working ON the demo app) can negate via
   // `.structxignore` (e.g. `!examples/my-app/**`).
-  'examples/**',
-  'example/**',
-  'demo/**',
-  'demos/**',
-  'playground/**',
-  'playgrounds/**',
-  'www/**',
-  'website/**',
-  'docs-site/**',
-  'scripts/**',
-  'e2e/**',           // e2e test apps live alongside src in many setups
+  '**/examples/**',
+  '**/example/**',
+  '**/demo/**',
+  '**/demos/**',
+  '**/sample/**',
+  '**/samples/**',
+  '**/playground/**',
+  '**/playgrounds/**',
+  '**/www/**',
+  '**/website/**',
+  '**/docs-site/**',
+  '**/scripts/**',
+  '**/e2e/**',         // e2e test apps — battle-tested case from NestJS:
+                       // sample/01-cats-app/e2e/, integration/.../e2e/
+                       // need recursive matching, not just top-level.
 ];
 // Note: `docs/`, `tools/`, `apps/` are intentionally NOT in defaults — they
 // can legitimately contain library source (e.g. Nx-style apps/, Effect-
