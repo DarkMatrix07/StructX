@@ -87,6 +87,48 @@ const DEFAULT_SOURCE_EXCLUDES = [
   '.storybook/**',
   '*.stories.ts',
   '*.stories.tsx',
+  // Test-runner setup files that don't match `*.config.*` — battle-tested
+  // case from Effect-TS where `vitest.workspace.ts`, `vitest.setup.ts`,
+  // and `vitest.shared.ts` leaked through and showed up as production
+  // entities. Wildcard matches `vitest.*` and `jest.*` companions too.
+  '**/vitest.setup.ts',
+  '**/vitest.setup.js',
+  '**/vitest.setup.mjs',
+  '**/vitest.shared.ts',
+  '**/vitest.shared.js',
+  '**/vitest.shared.mjs',
+  '**/vitest.workspace.ts',
+  '**/vitest.workspace.js',
+  '**/vitest.workspace.mjs',
+  '**/jest.setup.ts',
+  '**/jest.setup.js',
+  '**/jest.setup.mjs',
+  // Auto-generated code conventions — files named `*.generated.{ts,tsx,js,mjs}`
+  // or living under `__generated__/`, `generated/` directories. Battle-
+  // tested case from Effect-TS where AI-provider OpenAPI clients
+  // (packages/ai/openai/src/Generated.ts equivalents) emitted 200+
+  // synthetic routes from machine-generated client code.
+  '**/__generated__/**',
+  '**/generated/**',
+  '**/*.generated.ts',
+  '**/*.generated.tsx',
+  '**/*.generated.js',
+  '**/*.generated.jsx',
+  '**/*.generated.mjs',
+  // Bare `Generated.ts` (capitalized — convention from OpenAPI codegen,
+  // tRPC procedure codegen, and several other toolchains). Battle-tested
+  // case from Effect-TS where 4 different `Generated.ts` files in
+  // packages/ai/{openai,google,anthropic,openrouter}/src/ contributed
+  // 330 of the 337 detected "routes" — all from auto-generated AI
+  // provider clients. Users with hand-written code in a `Generated.ts`
+  // can negate via `.structxignore` (`!**/Generated.ts`).
+  '**/Generated.ts',
+  '**/Generated.tsx',
+  '**/Generated.js',
+  // Codegen output paths used by some toolchains
+  '**/*.gen.ts',
+  '**/*.gen.tsx',
+  '**/*.gen.js',
 
   // Monorepo non-library paths — common conventions across Yarn / pnpm /
   // Turbo / Nx / Lerna setups. Battle-tested on tRPC where these were

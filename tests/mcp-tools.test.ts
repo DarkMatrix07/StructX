@@ -202,6 +202,57 @@ describe('MCP graph tools', () => {
     expect(files).toEqual(['packages/core/src/lib.ts']);
   });
 
+  it('excludes auto-generated code (*.generated.ts, Generated.ts, __generated__/)', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Battle-tested case from Effect-TS: AI-provider OpenAPI clients
+    // (Generated.ts files) emitted 330 of the 337 detected "routes"
+    // from auto-generated client code. Plus the standard *.generated.ts
+    // and __generated__/ conventions used by graphql-codegen, Prisma,
+    // tRPC procedure codegen, and others.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-codegen-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'src', '__generated__'), { recursive: true });
+    mkdirSync(join(repo, 'src', 'generated'), { recursive: true });
+
+    writeFileSync(join(repo, 'src', 'real.ts'), `export function real(): number { return 1; }`);
+    writeFileSync(join(repo, 'src', 'Generated.ts'), `export function generatedClient(): number { return 2; }`);
+    writeFileSync(join(repo, 'src', 'schema.generated.ts'), `export function gqlSchema(): number { return 3; }`);
+    writeFileSync(join(repo, 'src', 'route.gen.ts'), `export function routeGen(): number { return 4; }`);
+    writeFileSync(join(repo, 'src', '__generated__', 'types.ts'), `export function genTypes(): number { return 5; }`);
+    writeFileSync(join(repo, 'src', 'generated', 'api.ts'), `export function genApi(): number { return 6; }`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const files = getAllFiles(db).map(f => f.path).sort();
+    db.close();
+
+    expect(files).toEqual(['src/real.ts']);
+  });
+
+  it('excludes vitest/jest setup files that do not match *.config.ts', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Battle-tested case from Effect-TS where vitest.workspace.ts /
+    // vitest.shared.ts / vitest.setup.ts at the repo root were
+    // incorrectly indexed as production source.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-vitest-setup-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+
+    writeFileSync(join(repo, 'src', 'real.ts'), `export function real(): number { return 1; }`);
+    writeFileSync(join(repo, 'vitest.workspace.ts'), `export default {};`);
+    writeFileSync(join(repo, 'vitest.shared.ts'), `export const shared = {};`);
+    writeFileSync(join(repo, 'vitest.setup.ts'), `export const setup = () => {};`);
+    writeFileSync(join(repo, 'jest.setup.ts'), `export const jestSetup = () => {};`);
+
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+    const files = getAllFiles(db).map(f => f.path).sort();
+    db.close();
+
+    expect(files).toEqual(['src/real.ts']);
+  });
+
   it('honors .structxignore overrides to re-enable excluded files', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     // For projects that DO want to index tests (e.g. for coverage tooling
