@@ -3,3 +3,7 @@ node_modules/
 dist/
 .structx/
 nul
+
+# Working session artifacts (ai-coding agent state, draft release notes)
+.claude/
+RELEASE-v*.md
