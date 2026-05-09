@@ -2,6 +2,50 @@
 
 All notable changes to StructX. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.3.1] — 2026-05-09
+
+### Added
+
+#### Inheritance-aware impact analysis
+
+`structx_impact` and `impactAnalysis()` now follow type-graph edges to
+include method overrides + their callers. Closes a real correctness gap
+in any OO codebase: changing `BaseService.run()` previously flagged
+only direct callers of `BaseService.run`, missing every override
+(`UserService.run`, `TaskService.run`) and every caller of those
+overrides via polymorphic dispatch (`const svc = new UserService();
+svc.run()`).
+
+The change combines three things:
+
+  1. **Walk subtypes transitively** via `type_relationships` (introduced
+     in v3.3.0) — Animal → Dog → Poodle finds Poodle.run when the user
+     asks about Animal.run.
+  2. **Pull each override into the impact set** — they are functions
+     that share the contract being changed.
+  3. **Over-include ambiguous callers** — `svc.run()` is recorded with
+     the variable's text (`svc.run`), which the conservative resolver
+     leaves NULL when multiple `*.run` methods exist. For impact
+     analysis we deliberately accept the false-positive risk: missing
+     a real caller is far worse than including a maybe-not-this-one.
+
+Free functions (no dot in name) skip this entirely — there's no
+heritage to walk.
+
+### Battle-test verification (round 7 — Stencil/Ionic)
+
+Cloned ionic-team/ionic-framework (~9000 files, ~1800 TS in core/) and
+ingested. **281 Stencil components extracted** — every `@Component({ tag: 'ion-X' })` correctly captured with its tag and class name. Web-component
+support from v3.3.0 verified end-to-end on real production code. **0 new
+bugs found in this round.**
+
+### Tests
+
+78 passing across 17 files (was 77).
+- `impact analysis includes method overrides AND their callers
+  (polymorphic dispatch)` — base + 2 overrides + 2 bootstrap callers
+  all flagged.
+
 ## [3.3.0] — 2026-05-08
 
 Closes the three remaining "deferred / known limitation" items from

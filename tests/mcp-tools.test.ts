@@ -427,6 +427,55 @@ export function consumer(): number {
     expect(callers.functions.map(fn => fn.name)).toContain('consumer');
   });
 
+  it('impact analysis includes method overrides AND their callers (polymorphic dispatch)', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    // Real-world OO codebase shape: a base class with a method, several
+    // subclasses overriding it, and external callers of the subclasses.
+    // Changing BaseService.run() touches not just the base method's
+    // direct callers but EVERY override's callers — that's the
+    // polymorphic-dispatch bit our pre-3.4 impact analysis missed.
+    const repo = mkdtempSync(join(tmpdir(), 'structx-inherit-impact-test-'));
+    cleanup.push(repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'app.ts'), `
+export abstract class BaseService { abstract run(): void; }
+
+export class UserService extends BaseService {
+  run(): void { /* user impl */ }
+}
+
+export class TaskService extends BaseService {
+  run(): void { /* task impl */ }
+}
+
+// Caller of an OVERRIDE — should be flagged when BaseService.run
+// changes contract, even though it never references BaseService.
+export function userBootstrap(): void {
+  const svc = new UserService();
+  svc.run();
+}
+
+// Caller of a different override.
+export function taskBootstrap(): void {
+  const svc = new TaskService();
+  svc.run();
+}
+`);
+    const db = initializeDatabase(join(repo, '.structx', 'db.sqlite'));
+    ingestDirectory(db, repo, 0.3);
+
+    const impact = impactAnalysis(db, 'BaseService.run');
+    db.close();
+
+    const names = impact.functions.map(fn => fn.name).sort();
+    // Both overrides flagged.
+    expect(names).toContain('UserService.run');
+    expect(names).toContain('TaskService.run');
+    // Direct callers of the overrides flagged transitively.
+    expect(names).toContain('userBootstrap');
+    expect(names).toContain('taskBootstrap');
+  });
+
   it('captures class extends + interface extends + class implements as type heritage', () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const repo = mkdtempSync(join(tmpdir(), 'structx-type-graph-test-'));

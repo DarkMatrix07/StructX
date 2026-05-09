@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import type { FunctionRow, TypeRow, RouteRow, ConstantRow, FileSummaryRow } from '../db/queries';
 import {
-  getFunctionByName, getFunctionsByName, getFunctionsByUnqualifiedName, getFunctionById, getCallees, getCallers, getCallersByName,
+  getFunctionByName, getFunctionsByName, getFunctionsByUnqualifiedName, getFunctionById, getCallees, getCallers, getCallersByName, getMethodOverrides,
   searchFunctions, getTransitiveCallersRobust,
   getAllRoutes, searchRoutes, getRoutesByFileId,
   getTypesByName, searchTypes, getAllTypes,
@@ -346,6 +346,56 @@ export function impactAnalysis(db: Database.Database, name: string): RetrievedCo
     if (seenIds.has(callerFn.id)) continue;
     seenIds.add(callerFn.id);
     ordered.push(callerFn);
+  }
+
+  // Inheritance-aware impact: when the target is a method like
+  // `BaseService.run`, every override (UserService.run, TaskService.run,
+  // etc.) is implicitly affected by a contract change — and so are
+  // their direct callers. Walks subtypes transitively, so a deep chain
+  // (Animal → Dog → Poodle) flags Poodle.run when the user asks about
+  // Animal.run. Free functions (no dot in name) skip this entirely.
+  const overrideRows = matches.flatMap(fn => getMethodOverrides(db, fn.name));
+  if (overrideRows.length > 0) {
+    // Collect every method-name suffix we want to flag. For impact, we
+    // intentionally over-include: callers using a variable receiver
+    // (`svc.run()`) get recorded with the variable's text, which the
+    // resolver leaves NULL when ambiguous. Pulling all `*.run` callers
+    // means changing BaseService.run flags every consumer of `svc.run()`
+    // even though we can't statically prove which override it dispatches
+    // to. Slight noise risk, but for "what might break?" answers,
+    // false-positive > false-negative.
+    const methodSuffixes = new Set<string>();
+    for (const fn of [...matches, ...overrideRows]) {
+      const dot = fn.name.indexOf('.');
+      if (dot > 0) methodSuffixes.add(fn.name.slice(dot + 1));
+    }
+
+    for (const override of overrideRows) {
+      if (seenIds.has(override.id)) continue;
+      seenIds.add(override.id);
+      ordered.push(override);
+    }
+
+    // Find every caller of a name ending in .<methodSuffix> — captures
+    // both resolved-but-different-target callers AND unresolved
+    // ambiguous ones. Filtered down to in-graph functions so we don't
+    // leak NULL or out-of-graph caller IDs.
+    if (methodSuffixes.size > 0) {
+      const suffixList = [...methodSuffixes];
+      const conditions = suffixList.map(() => `callee_name LIKE ?`).join(' OR ');
+      const params = suffixList.map(s => `%.${s}`);
+      const ambiguousCallers = db.prepare(`
+        SELECT DISTINCT caller_function_id FROM relationships
+        WHERE caller_function_id IS NOT NULL
+          AND (${conditions})
+      `).all(...params) as Array<{ caller_function_id: number }>;
+      for (const row of ambiguousCallers) {
+        if (seenIds.has(row.caller_function_id)) continue;
+        seenIds.add(row.caller_function_id);
+        const fn = getFunctionById(db, row.caller_function_id);
+        if (fn) ordered.push(fn);
+      }
+    }
   }
 
   const cache = buildEnrichCache(db, ordered);

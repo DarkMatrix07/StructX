@@ -760,6 +760,62 @@ export function resolveTypeRelationships(db: Database.Database): number {
 // "what implements Repository?". Returns both resolved (by id) and
 // unresolved (by name) edges so callers see inheritance even from types
 // outside the indexed graph.
+// Given a qualified method name like "BaseService.run", find functions in
+// every subtype/implementer that have a method with the same final segment
+// (e.g. "UserService.run", "TaskService.run"). Used by impact analysis
+// to flag polymorphic dispatch — when a base method changes, every
+// override is implicitly affected, and so are their direct callers.
+//
+// Walks type heritage transitively, so a deep chain (Animal → Dog →
+// Poodle) finds Poodle.run when the user asks about Animal.run.
+export function getMethodOverrides(db: Database.Database, qualifiedName: string): FunctionRow[] {
+  const dotIdx = qualifiedName.indexOf('.');
+  if (dotIdx <= 0) return []; // Free functions don't have overrides.
+  const baseClass = qualifiedName.slice(0, dotIdx);
+  const methodName = qualifiedName.slice(dotIdx + 1);
+
+  // Walk subtypes transitively. Use a Set to avoid cycles (TypeScript
+  // doesn't allow real cycles in heritage, but indexed-from-different-files
+  // duplicates can produce equivalent rows).
+  const visited = new Set<string>([baseClass]);
+  const queue: string[] = [baseClass];
+  const subtypeNames: string[] = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    let directSubs: Array<{ name: string }>;
+    try {
+      directSubs = db.prepare(`
+        SELECT t.name FROM types t
+        JOIN type_relationships tr ON tr.subtype_id = t.id
+        WHERE tr.supertype_name = ?
+      `).all(current) as Array<{ name: string }>;
+    } catch {
+      directSubs = [];
+    }
+    for (const sub of directSubs) {
+      if (visited.has(sub.name)) continue;
+      visited.add(sub.name);
+      subtypeNames.push(sub.name);
+      queue.push(sub.name);
+    }
+  }
+
+  if (subtypeNames.length === 0) return [];
+
+  // Find functions named `${subtype}.${method}` for each subtype.
+  // Parameterized to avoid any quote weirdness even though TS identifiers
+  // can't contain quotes — better hygiene + future-proof if names ever
+  // come from a less-constrained source.
+  const candidates = subtypeNames.map(s => `${s}.${methodName}`);
+  const placeholders = candidates.map(() => '?').join(',');
+  return db.prepare(`
+    SELECT * FROM functions
+    WHERE name IN (${placeholders})
+    ORDER BY file_id, start_line
+  `).all(...candidates) as FunctionRow[];
+}
+
 export function getSubtypesOf(db: Database.Database, supertypeName: string): Array<TypeRow & { relation_kind: 'extends' | 'implements' }> {
   try {
     return db.prepare(`
