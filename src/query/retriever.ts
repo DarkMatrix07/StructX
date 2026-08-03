@@ -8,7 +8,7 @@ import {
   getAllFunctions, getAllFiles, getAllFileSummaries,
   getConstantsByFileId, getFileOverview,
   searchFiles, searchConstants, getFileSummary, getFileByPath,
-  getFunctionNamesByIds, getFilePathsByIds,
+  getFunctionNamesByIds, getFilePathsByIds, getRoutesByHandlerFunctionIds,
 } from '../db/queries';
 import { sanitizeFtsTerms, sanitizeFtsQuery } from '../utils/fts';
 
@@ -398,12 +398,25 @@ export function impactAnalysis(db: Database.Database, name: string): RetrievedCo
     }
   }
 
-  const cache = buildEnrichCache(db, ordered);
+  // HTTP endpoints in the blast radius. A change reaches an endpoint when the
+  // endpoint's handler is the changed function itself, or any function in the
+  // transitive caller set. This is what route→handler linking buys: the
+  // answer to "what breaks?" now includes the API surface, not just internal
+  // functions. Routes with inline handlers stay out — there is no function
+  // row to trace through them.
+  const affectedIds = [...matches.map(f => f.id), ...ordered.map(f => f.id)];
+  const affectedRoutes = getRoutesByHandlerFunctionIds(db, [...new Set(affectedIds)]);
+
+  const cache = buildEnrichCache(db, ordered, [], affectedRoutes);
   // Impact answers benefit from seeing the actual caller bodies — the LLM
   // needs to reason about HOW each caller uses the changed function, not
   // just that it does. Cap at 8 to stay within the 3000-token budget.
   const includeBody = ordered.length <= 8;
-  return { ...emptyContext('impact'), functions: ordered.map(f => enrichFunction(db, f, cache, { includeBody })) };
+  return {
+    ...emptyContext('impact'),
+    functions: ordered.map(f => enrichFunction(db, f, cache, { includeBody })),
+    routes: affectedRoutes.map(r => enrichRoute(db, r, cache)),
+  };
 }
 
 // ── New retriever strategies ──

@@ -1,5 +1,5 @@
 import { createLlmClient, type LlmClientConfig } from '../utils/llm';
-import { estimateCost } from '../utils/tokens';
+import { resolveCost } from '../utils/tokens';
 import { normalizeRepoPath } from '../utils/paths';
 
 export type QueryStrategy = 'direct' | 'relationship' | 'semantic' | 'domain' | 'impact' | 'route' | 'type' | 'file' | 'list' | 'pattern';
@@ -254,12 +254,12 @@ export async function classifyQuestionWithUsage(
 
   const client = createLlmClient(llmConfig);
 
-  const { text, inputTokens, outputTokens } = await client.complete({
+  const { text, inputTokens, outputTokens, costUsd } = await client.complete({
     model,
     prompt: `${CLASSIFICATION_PROMPT}\n\nQuestion: "${question}"`,
     maxTokens: 200,
   });
-  const cost = estimateCost(model, inputTokens, outputTokens);
+  const cost = resolveCost(model, inputTokens, outputTokens, costUsd);
 
   try {
     const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();

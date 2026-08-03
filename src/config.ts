@@ -15,6 +15,12 @@ export interface StructXConfig {
   answerMaxTokens: number;
   batchSize: number;
   diffThreshold: number;
+  // Resolve call targets through the TypeScript type checker during ingest.
+  // On by default: it is what makes the call graph exact rather than a
+  // name-matching guess. Costs roughly 40% more ingest time, so very large
+  // repos can set this to false in .structx/config.json and fall back to the
+  // pre-3.4 name-based resolver.
+  typeResolution: boolean;
   structxDir: string;
 }
 
@@ -43,6 +49,7 @@ const DEFAULT_CONFIG: Omit<StructXConfig, 'repoPath' | 'anthropicApiKey' | 'stru
   answerMaxTokens: 1024,
   batchSize: 8,
   diffThreshold: 0.3,
+  typeResolution: true,
 };
 
 export function getStructXDir(repoPath?: string): string {
@@ -87,6 +94,7 @@ export function loadConfig(structxDir: string): StructXConfig {
     classifierModel: raw.classifierModel ?? raw.queryModel ?? providerDefaults.classifierModel,
     answerModel: raw.answerModel ?? raw.queryModel ?? providerDefaults.answerModel,
     answerMaxTokens: normalizeAnswerMaxTokens(raw.answerMaxTokens),
+    typeResolution: raw.typeResolution !== false,
     anthropicApiKey: apiKey,
     structxDir,
   };

@@ -6,6 +6,52 @@ const VALID_DOMAINS = new Set([
 
 const VALID_COMPLEXITY = new Set(['low', 'medium', 'high']);
 
+// Side effects are a filterable index, not prose. Left as free text, a model
+// emits "DB writes", "network calls", "Network call to logout function" and
+// "Sends JSON response" for what are really three concepts — so
+// `structx query --side-effect write` matched one function and silently
+// missed the rest. A closed vocabulary makes the filter mean something.
+const VALID_SIDE_EFFECTS = new Set([
+  'db_read', 'db_write', 'network', 'filesystem',
+  'console', 'response', 'cache', 'state', 'process',
+]);
+
+// Map the free-text phrasings models actually produce onto the tags above, so
+// a slightly off-script response is salvaged rather than discarded. Checked as
+// substrings against the lowercased value, most specific first.
+const SIDE_EFFECT_ALIASES: Array<[RegExp, string]> = [
+  [/\b(db|database|sql|persist)\w*\s*(write|insert|update|delete|save)|write.*\b(db|database)\b/, 'db_write'],
+  [/\b(db|database|sql)\w*\s*(read|query|select|fetch|lookup)|read.*\b(db|database)\b/, 'db_read'],
+  [/\b(network|http|https|api call|rpc|fetch|request to|outbound)\b/, 'network'],
+  [/\b(file\s?system|file write|file read|disk|fs\.)\b/, 'filesystem'],
+  [/\b(console|stdout|stderr|log output|logging output)\b/, 'console'],
+  [/\b(response|res\.|sends json|http response)\b/, 'response'],
+  [/\bcache\b/, 'cache'],
+  [/\b(mutat|global state|shared state|module state)\w*\b/, 'state'],
+  [/\b(spawn|child process|process\.exit|environment variable)\b/, 'process'],
+];
+
+// Coerce one reported side effect to a known tag, or null to drop it.
+function normalizeSideEffect(raw: string): string | null {
+  const value = String(raw).trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (VALID_SIDE_EFFECTS.has(value)) return value;
+  const spaced = value.replace(/_/g, ' ');
+  if (spaced === 'none' || spaced === 'no side effects' || !spaced) return null;
+  for (const [pattern, tag] of SIDE_EFFECT_ALIASES) {
+    if (pattern.test(spaced)) return tag;
+  }
+  return null;
+}
+
+export function normalizeSideEffects(values: unknown[]): string[] {
+  const out = new Set<string>();
+  for (const value of values) {
+    const tag = normalizeSideEffect(String(value));
+    if (tag) out.add(tag);
+  }
+  return [...out];
+}
+
 export interface SemanticResult {
   function_name: string;
   purpose: string;
@@ -96,7 +142,7 @@ export function validateSemanticResponse(responseText: string): ValidationResult
     results.push({
       function_name: item.function_name.trim(),
       purpose: sanitizeText(item.purpose),
-      side_effects: item.side_effects.map((s: any) => sanitizeText(String(s))),
+      side_effects: normalizeSideEffects(item.side_effects),
       behavior: sanitizeText(item.behavior),
       domain: item.domain,
       complexity: item.complexity,

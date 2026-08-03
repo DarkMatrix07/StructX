@@ -1,4 +1,4 @@
-import { SourceFile, SyntaxKind, Node, ClassDeclaration, MethodDeclaration } from 'ts-morph';
+import { SourceFile, SyntaxKind, Node, ClassDeclaration, MethodDeclaration, CallExpression, ArrowFunction, FunctionExpression } from 'ts-morph';
 
 export interface ExtractedRoute {
   method: string;
@@ -18,9 +18,224 @@ const DECORATOR_HTTP_METHODS = new Set([
   'get', 'post', 'put', 'delete', 'patch', 'all', 'head', 'options',
 ]);
 
+// An inline handler passed directly to a route registration:
+//   router.get('/articles', async (req, res) => { ... })
+// This is the dominant Express idiom, and until 3.4.0 it produced no function
+// row at all — so an Express app's entire controller layer was missing from
+// the graph. These are surfaced as functions under a synthetic name so they
+// behave like any other node: they carry call edges, appear in impact
+// analysis, and give routes something to link to.
+export interface InlineRouteHandler {
+  name: string;
+  node: ArrowFunction | FunctionExpression;
+  startLine: number;
+  endLine: number;
+  params: string;
+  isAsync: boolean;
+}
+
+// The single source of truth for naming inline handlers. The parser, the
+// relationship extractor, and the route extractor all derive the name from
+// here so a route's handler_name always matches the function row's name.
+export function inlineHandlerName(method: string, routePath: string): string {
+  return `${method.toUpperCase()} ${routePath}`;
+}
+
+// Shared route-call matcher. Both `extractRoutes` and `findInlineRouteHandlers`
+// go through this so the two can never disagree about what counts as a route.
+interface MatchedRouteCall {
+  method: string;
+  routePath: string;
+  args: Node[];
+}
+
+function matchRouteCall(callExpr: CallExpression): MatchedRouteCall | null {
+  const expression = callExpr.getExpression();
+  if (!Node.isPropertyAccessExpression(expression)) return null;
+
+  const methodName = expression.getName().toLowerCase();
+  if (!HTTP_METHODS.has(methodName)) return null;
+
+  const args = callExpr.getArguments();
+  if (args.length < 2) return null;
+
+  const firstArg = args[0];
+  let routePath: string | null = null;
+  if (Node.isStringLiteral(firstArg)) {
+    routePath = firstArg.getLiteralValue();
+  } else {
+    const text = firstArg.getText();
+    if (text.startsWith("'") || text.startsWith('"') || text.startsWith('`')) {
+      routePath = text.replace(/^['"`]|['"`]$/g, '');
+    }
+  }
+  if (!routePath || (!routePath.startsWith('/') && methodName !== 'use')) return null;
+
+  const lastArg = args[args.length - 1];
+  if (Node.isStringLiteral(lastArg) || Node.isNoSubstitutionTemplateLiteral(lastArg)) return null;
+
+  return { method: methodName.toUpperCase(), routePath, args };
+}
+
+// Walking every CallExpression in a file is not cheap, and three separate
+// passes wanted the same list (route registrations, inline handlers, and the
+// relationship extractor's own scan). Memoizing per SourceFile collapses the
+// redundant walks; the WeakMap means entries disappear with the AST when
+// ts-morph drops the file.
+const callExpressionCache = new WeakMap<SourceFile, CallExpression[]>();
+
+function getCallExpressions(sourceFile: SourceFile): CallExpression[] {
+  const cached = callExpressionCache.get(sourceFile);
+  if (cached) return cached;
+  const found = sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression);
+  callExpressionCache.set(sourceFile, found);
+  return found;
+}
+
+const inlineHandlerCache = new WeakMap<SourceFile, InlineRouteHandler[]>();
+
+// A route registration must contain a literal `.get(` / `.post(` / … in the
+// source text. Testing that first lets files with no route calls skip the
+// full CallExpression walk — the relationship extractor holds a different
+// SourceFile instance than the parser, so it cannot share the memo above and
+// would otherwise re-walk every file in the repo.
+const ROUTE_CALL_HINT = /\.\s*(get|post|put|delete|patch|all|use)\s*\(/i;
+
+export function findInlineRouteHandlers(sourceFile: SourceFile): InlineRouteHandler[] {
+  const cached = inlineHandlerCache.get(sourceFile);
+  if (cached) return cached;
+  if (!ROUTE_CALL_HINT.test(sourceFile.getFullText())) {
+    inlineHandlerCache.set(sourceFile, []);
+    return [];
+  }
+  const handlers: InlineRouteHandler[] = [];
+  for (const callExpr of getCallExpressions(sourceFile)) {
+    const matched = matchRouteCall(callExpr);
+    if (!matched) continue;
+    const lastArg = matched.args[matched.args.length - 1];
+    if (!Node.isArrowFunction(lastArg) && !Node.isFunctionExpression(lastArg)) continue;
+
+    handlers.push({
+      name: inlineHandlerName(matched.method, matched.routePath),
+      node: lastArg,
+      startLine: lastArg.getStartLineNumber(),
+      endLine: lastArg.getEndLineNumber(),
+      params: lastArg.getParameters().map(p => p.getText()).join(', '),
+      isAsync: lastArg.isAsync(),
+    });
+  }
+  inlineHandlerCache.set(sourceFile, handlers);
+  return handlers;
+}
+
+// HTTP verbs that a file-based route module exports as named functions.
+const FILE_ROUTE_EXPORTS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
+
+// Derive the URL path a file-based route module serves, from its location on
+// disk. Covers the conventions that replaced `app.get(...)` in most modern
+// frameworks:
+//
+//   Next.js App Router  app/api/users/[id]/route.ts   -> /api/users/:id
+//   Next.js Pages API   pages/api/users/[id].ts       -> /api/users/:id
+//   SvelteKit           src/routes/users/+server.ts   -> /users
+//   Medusa v2           src/api/admin/orders/route.ts -> /admin/orders
+//
+// Returns null when the file is not a route module. Dynamic segments become
+// `:param`, catch-alls become `*`, and Next.js route groups `(marketing)` are
+// dropped since they do not appear in the URL.
+export function fileBasedRoutePath(absoluteFilePath: string): string | null {
+  const normalized = absoluteFilePath.replace(/\\/g, '/');
+  const fileName = normalized.slice(normalized.lastIndexOf('/') + 1);
+  const isRouteModule = /^route\.(ts|tsx|js|mjs)$/.test(fileName);
+  const isServerModule = /^\+server\.(ts|js)$/.test(fileName);
+  const isPagesApi = /\/pages\/api\//.test(normalized);
+  if (!isRouteModule && !isServerModule && !isPagesApi) return null;
+
+  // Anchor on the framework's routing root, taking the LAST occurrence so a
+  // monorepo path like apps/web/app/... resolves against the inner one.
+  const anchors = isPagesApi ? ['/pages/'] : ['/app/', '/routes/', '/api/', '/src/'];
+  let rest: string | null = null;
+  for (const anchor of anchors) {
+    const idx = normalized.lastIndexOf(anchor);
+    if (idx === -1) continue;
+    // Note `api` is treated differently depending on which anchor matched.
+    // Under `app/` it is an ordinary URL segment (Next.js App Router serves
+    // app/api/users at /api/users), and the `/app/` anchor above already
+    // keeps it in `rest`. When `/api/` is itself the anchor the file is a
+    // Medusa-style module rooted at src/api, where `api` is the convention
+    // marker and not part of the URL.
+    rest = normalized.slice(idx + anchor.length);
+    break;
+  }
+  if (rest === null) return null;
+
+  // Drop the filename; for pages/api the filename IS the last URL segment.
+  const parts = rest.split('/');
+  const last = parts.pop() ?? '';
+  if (isPagesApi) {
+    const base = last.replace(/\.(ts|tsx|js|mjs)$/, '');
+    if (base !== 'index') parts.push(base);
+  }
+
+  const segments: string[] = [];
+  for (const raw of parts) {
+    if (!raw) continue;
+    // Route groups and private folders never appear in the URL.
+    if (/^\(.*\)$/.test(raw) || raw.startsWith('_')) continue;
+    const catchAll = raw.match(/^\[\.\.\.(.+)\]$/);
+    if (catchAll) { segments.push('*'); continue; }
+    const dynamic = raw.match(/^\[(.+)\]$/);
+    segments.push(dynamic ? `:${dynamic[1].replace(/^\.\.\./, '')}` : raw);
+  }
+
+  return '/' + segments.join('/');
+}
+
+// Routes declared by exporting an HTTP-verb-named function from a route
+// module. The exported function is the handler, so it links to the graph the
+// same way a named Express handler does.
+function extractFileBasedRoutes(sourceFile: SourceFile): ExtractedRoute[] {
+  const routePath = fileBasedRoutePath(sourceFile.getFilePath());
+  if (routePath === null) return [];
+
+  const routes: ExtractedRoute[] = [];
+  const push = (method: string, name: string, node: Node) => {
+    routes.push({
+      method,
+      path: routePath,
+      handlerName: name,
+      handlerBody: node.getText().substring(0, 2000),
+      middleware: null,
+      startLine: node.getStartLineNumber(),
+      endLine: node.getEndLineNumber(),
+    });
+  };
+
+  for (const fn of sourceFile.getFunctions()) {
+    const name = fn.getName();
+    if (!name || !fn.isExported()) continue;
+    if (FILE_ROUTE_EXPORTS.has(name)) push(name, name, fn);
+    // `export default function handler(req, res)` — the Pages API shape.
+    else if (fn.isDefaultExport()) push('ALL', name, fn);
+  }
+
+  for (const varStmt of sourceFile.getVariableStatements()) {
+    if (!varStmt.isExported()) continue;
+    for (const decl of varStmt.getDeclarations()) {
+      const name = decl.getName();
+      if (!FILE_ROUTE_EXPORTS.has(name)) continue;
+      const initializer = decl.getInitializer();
+      if (!initializer || (!Node.isArrowFunction(initializer) && !Node.isFunctionExpression(initializer))) continue;
+      push(name, name, decl);
+    }
+  }
+
+  return routes;
+}
+
 export function extractRoutes(sourceFile: SourceFile): ExtractedRoute[] {
   const routes: ExtractedRoute[] = [];
-  const callExpressions = sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression);
+  const callExpressions = getCallExpressions(sourceFile);
 
   for (const callExpr of callExpressions) {
     const expression = callExpr.getExpression();
@@ -50,16 +265,27 @@ export function extractRoutes(sourceFile: SourceFile): ExtractedRoute[] {
 
     if (!routePath || (!routePath.startsWith('/') && methodName !== 'use')) continue;
 
+    // A route registration always supplies a handler after the path. Without
+    // this check, any `.get()` / `.set()` on a Map or filesystem helper whose
+    // key happens to look like a path becomes a phantom endpoint — the
+    // TypeScript compiler repo produced 29 of them from `map.get('/foo/bar')`
+    // calls in its test suite, none of which are HTTP routes.
+    if (args.length < 2) continue;
+
     // Last argument is the handler
     const lastArg = args[args.length - 1];
+    // ...and a handler is never a string. `map.set('/a', '/b')` is a lookup
+    // table, not a route.
+    if (Node.isStringLiteral(lastArg) || Node.isNoSubstitutionTemplateLiteral(lastArg)) continue;
     const handlerBody = lastArg.getText().substring(0, 2000); // Truncate very large handlers
 
-    // Try to extract handler name
+    // Try to extract handler name. Inline handlers get the synthetic name the
+    // parser also assigns them, so the ingester can link route → function.
     let handlerName: string | null = null;
     if (Node.isIdentifier(lastArg)) {
       handlerName = lastArg.getText();
     } else if (Node.isArrowFunction(lastArg) || Node.isFunctionExpression(lastArg)) {
-      handlerName = null; // Inline handler
+      handlerName = inlineHandlerName(methodName, routePath);
     }
 
     // Middleware: arguments between path and handler
@@ -85,6 +311,9 @@ export function extractRoutes(sourceFile: SourceFile): ExtractedRoute[] {
     routes.push(...extractDecoratorRoutes(classDecl));
     routes.push(...extractWebComponents(classDecl));
   }
+
+  // File-based routes (Next.js App Router, Pages API, SvelteKit, Medusa v2).
+  routes.push(...extractFileBasedRoutes(sourceFile));
 
   return routes;
 }
@@ -217,6 +446,27 @@ function readDecoratorStringArg(dec: import('ts-morph').Decorator): string | und
   if (Node.isStringLiteral(first)) return first.getLiteralValue();
   // Template literals without interpolation are treated as static paths.
   if (Node.isNoSubstitutionTemplateLiteral(first)) return first.getLiteralValue();
+
+  // NestJS's options form: `@Controller({ path: '/v2/users', version: '2' })`.
+  // An officially supported signature that cal.com uses throughout its v2 API
+  // — without this, 21% of its routes collapsed to '/' and the rest lost
+  // their controller prefix, showing up as bare `/:webhookId`.
+  if (Node.isObjectLiteralExpression(first)) {
+    for (const prop of first.getProperties()) {
+      if (!Node.isPropertyAssignment(prop)) continue;
+      if (prop.getName() !== 'path') continue;
+      const initializer = prop.getInitializer();
+      if (initializer && Node.isStringLiteral(initializer)) return initializer.getLiteralValue();
+      if (initializer && Node.isNoSubstitutionTemplateLiteral(initializer)) return initializer.getLiteralValue();
+      // `path: ['a', 'b']` — NestJS allows an array; take the first entry so
+      // the route still has a recognizable prefix.
+      if (initializer && Node.isArrayLiteralExpression(initializer)) {
+        const firstEl = initializer.getElements()[0];
+        if (firstEl && Node.isStringLiteral(firstEl)) return firstEl.getLiteralValue();
+      }
+    }
+    return undefined;
+  }
 
   // Enum member reference — `@Controller(RouteKey.Asset)`. Real-world case
   // from immich: all 40 controllers use `@Controller(RouteKey.X)` instead

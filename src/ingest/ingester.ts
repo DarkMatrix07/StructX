@@ -1,12 +1,14 @@
 import * as path from 'path';
 import * as fs from 'fs';
+import * as v8 from 'v8';
 import type Database from 'better-sqlite3';
 import type { Project } from 'ts-morph';
 import {
   upsertFile, getFileByPath, insertFunction, getFunctionsByFileId,
   deleteFunctionsByFileId, deleteRelationshipsByCallerFunctionId,
   insertRelationship, resolveUniqueCalleeFunctionId, enqueueForAnalysis,
-  resolveNullCallees, resolveTypeRelationships, rebuildAllFtsIndexes,
+  resolveNullCallees, resolveTypeRelationships, resolveRouteHandlers, rebuildAllFtsIndexes,
+  type CalleeDeclaration,
   copySemanticFields,
   insertType, deleteTypesByFileId,
   insertRoute, deleteRoutesByFileId,
@@ -29,14 +31,38 @@ export interface SingleFileIngestResult {
   queued: number;
 }
 
-// Ingest one file. Caller is responsible for running resolveNullCallees and
-// rebuildAllFtsIndexes after a batch of changes (debounced in watch mode).
+export interface IngestOptions {
+  // Resolve call targets through the TypeScript type checker instead of by
+  // name alone. On by default — it is the difference between an exact call
+  // graph and a heuristic one. Disable for very large repos where the
+  // checker's cost outweighs the precision gain.
+  typeResolution?: boolean;
+}
+
+// Convert a checker-resolved declaration site into the repo-relative form the
+// database stores. Returns null for declarations outside the repo (a linked
+// package, a monorepo sibling that isn't indexed) — those have no functions
+// row to bind to.
+function toRepoRelativeDeclaration(
+  repoPath: string,
+  resolved: { filePath: string; name: string } | undefined,
+): CalleeDeclaration | null {
+  if (!resolved) return null;
+  const rel = path.relative(repoPath, resolved.filePath).split(path.sep).join('/');
+  if (!rel || rel.startsWith('..')) return null;
+  return { file: rel, name: resolved.name };
+}
+
+// Ingest one file. Caller is responsible for running resolveNullCallees,
+// resolveRouteHandlers and rebuildAllFtsIndexes after a batch of changes
+// (debounced in watch mode).
 export function ingestSingleFile(
   db: Database.Database,
   project: Project,
   repoPath: string,
   filePath: string,
   diffThreshold: number,
+  opts: IngestOptions = {},
 ): SingleFileIngestResult {
   const relativePath = path.relative(repoPath, filePath).split(path.sep).join('/');
   const content = fs.readFileSync(filePath, 'utf-8');
@@ -66,6 +92,16 @@ export function ingestSingleFile(
       deleteConstantsByFileId(db, fileId);
     }
 
+    // Each extractor loads the file independently and drops it again. That
+    // looks like wasted work — the file is parsed twice — but measurement says
+    // otherwise: sharing one AST across both extractors made nest 23% slower
+    // (205s -> 253s) and doubled peak heap (410MB -> 819MB). Each
+    // `removeSourceFile` invalidates ts-morph's Program, which evicts the
+    // transitive dependency graph the type checker pulls in; without that
+    // eviction the Program grows for the whole run and every subsequent
+    // checker query pays for it. The redundant parse is cheaper than the
+    // memory it reclaims. `parseSourceFile` / `extractCallsFromSourceFile`
+    // remain exported for callers that already hold a SourceFile.
     let parsed;
     try {
       // Refresh ts-morph's view of the file before re-parsing — otherwise watch
@@ -116,6 +152,11 @@ export function ingestSingleFile(
     for (const r of parsed.routes) {
       insertRoute(db, {
         file_id: fileId, method: r.method, path: r.path, handler_name: r.handlerName,
+        // Same-file handlers bind immediately — decorator routes name their
+        // handler `Controller.method`, which is exactly the key the parser
+        // used. Cross-file handlers are bound by resolveRouteHandlers once
+        // every file has been ingested.
+        handler_function_id: r.handlerName ? functionIdMap.get(r.handlerName) ?? null : null,
         handler_body: r.handlerBody, middleware: r.middleware,
         start_line: r.startLine, end_line: r.endLine,
       });
@@ -144,14 +185,24 @@ export function ingestSingleFile(
     });
 
     try {
-      const calls = extractCallsFromFile(project, filePath);
+      const calls = extractCallsFromFile(project, filePath, { typeResolution: opts.typeResolution });
       for (const call of calls) {
         if (call.callerName === '__file__') continue;
         const callerId = functionIdMap.get(call.callerName);
         if (!callerId) continue;
+
+        // Precise path: the type checker told us exactly which declaration
+        // this call targets. Bind straight to it when that file is already
+        // ingested; otherwise persist the declaration site so the post-ingest
+        // resolver can bind it regardless of file order.
+        const decl = toRepoRelativeDeclaration(repoPath, call.resolved);
+        const declId = decl && decl.file === relativePath
+          ? functionIdMap.get(decl.name)
+          : undefined;
+
         const inFileId = functionIdMap.get(call.calleeName);
-        const calleeId = inFileId ?? resolveUniqueCalleeFunctionId(db, call.calleeName);
-        insertRelationship(db, callerId, call.calleeName, call.relationType, calleeId ?? undefined);
+        const calleeId = declId ?? inFileId ?? resolveUniqueCalleeFunctionId(db, call.calleeName);
+        insertRelationship(db, callerId, call.calleeName, call.relationType, calleeId ?? undefined, decl ?? undefined);
         counts.relationships++;
       }
     } catch (err: any) {
@@ -201,12 +252,44 @@ export interface IngestResult {
   queued: number;
 }
 
+// Heap thresholds for the type-resolution guard below, as a fraction of V8's
+// hard limit. Crossing the first warns; crossing the second degrades.
+const HEAP_WARN_RATIO = 0.75;
+const HEAP_DEGRADE_RATIO = 0.88;
+
+function heapUsedRatio(): number {
+  const limit = v8.getHeapStatistics().heap_size_limit;
+  if (!limit) return 0;
+  return process.memoryUsage().heapUsed / limit;
+}
+
+// SQLite reports a contended write lock as SQLITE_BUSY. Before 3.4.0 this
+// escaped as an unhandled better-sqlite3 stack trace — the most likely cause
+// (a `structx watch` running against the same graph) was nowhere in the
+// message.
+export class GraphLockedError extends Error {
+  constructor(repoPath: string) {
+    super(
+      `The graph for ${repoPath} is locked by another process.\n` +
+      `A "structx watch" or a second ingest is probably writing to it. ` +
+      `Stop that process and re-run, or point --repo at a different checkout.`,
+    );
+    this.name = 'GraphLockedError';
+  }
+}
+
+export function isDatabaseLockedError(err: unknown): boolean {
+  const code = (err as { code?: string } | undefined)?.code;
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED';
+}
+
 export function ingestDirectory(
   db: Database.Database,
   repoPath: string,
-  diffThreshold: number
+  diffThreshold: number,
+  opts: IngestOptions = {},
 ): IngestResult {
-  const project = createProject(repoPath);
+  let project = createProject(repoPath);
   const files = scanDirectory(repoPath);
 
   console.log(`Found ${files.length} TypeScript files.`);
@@ -223,8 +306,49 @@ export function ingestDirectory(
     queued: 0,
   };
 
+  // Type resolution makes ts-morph retain the transitive import graph, which
+  // on large repos can exhaust the default heap. Previously that surfaced as
+  // a silent process death with no output at all. Watch the heap and degrade
+  // to name matching before V8 kills us: a slightly less precise graph beats
+  // no graph and no error message.
+  let typeResolution = opts.typeResolution !== false;
+  let warnedHighHeap = false;
+  let degradedAt: number | null = null;
+  let processed = 0;
+
   for (const filePath of files) {
-    const fileResult = ingestSingleFile(db, project, repoPath, filePath, diffThreshold);
+    if (typeResolution && ++processed % 25 === 0) {
+      const ratio = heapUsedRatio();
+      if (ratio >= HEAP_DEGRADE_RATIO) {
+        typeResolution = false;
+        degradedAt = processed;
+        logger.warn(
+          `Heap at ${(ratio * 100).toFixed(0)}% of limit after ${processed}/${files.length} files — ` +
+          `disabling type resolution for the rest of this run to avoid running out of memory. ` +
+          `Re-run with a larger heap (NODE_OPTIONS=--max-old-space-size=8192) for a fully resolved graph, ` +
+          `or set "typeResolution": false in .structx/config.json to make this the default.`,
+        );
+        // Drop every AST ts-morph is holding; the remaining files are parsed
+        // syntactically and do not need the resolved import graph.
+        project = createProject(repoPath);
+      } else if (ratio >= HEAP_WARN_RATIO && !warnedHighHeap) {
+        warnedHighHeap = true;
+        logger.warn(
+          `Heap at ${(ratio * 100).toFixed(0)}% of limit after ${processed}/${files.length} files. ` +
+          `If ingest dies without output, re-run with NODE_OPTIONS=--max-old-space-size=8192.`,
+        );
+      }
+    }
+
+    let fileResult;
+    try {
+      fileResult = ingestSingleFile(db, project, repoPath, filePath, diffThreshold, { typeResolution });
+    } catch (err) {
+      // A locked graph will not resolve by trying the next file — stop and
+      // tell the user what is holding it.
+      if (isDatabaseLockedError(err)) throw new GraphLockedError(repoPath);
+      throw err;
+    }
     if (fileResult.status === 'unchanged') { result.unchangedFiles++; continue; }
     if (fileResult.status === 'parse-failed') { result.changedFiles++; continue; }
     if (fileResult.status === 'new') result.newFiles++;
@@ -248,7 +372,18 @@ export function ingestDirectory(
   if (typeRelCount > 0) {
     logger.info(`Resolved ${typeRelCount} type heritage edge(s)`);
   }
+  const routeHandlerCount = resolveRouteHandlers(db);
+  if (routeHandlerCount > 0) {
+    logger.info(`Linked ${routeHandlerCount} route(s) to handler functions`);
+  }
   rebuildAllFtsIndexes(db);
+
+  if (degradedAt !== null) {
+    console.log(
+      `\nNote: type resolution was disabled after ${degradedAt} files due to memory pressure. ` +
+      `Call edges from the remaining files were matched by name only.`,
+    );
+  }
 
   return result;
 }

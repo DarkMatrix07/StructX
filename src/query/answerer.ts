@@ -1,5 +1,5 @@
 import { createLlmClient, type LlmClientConfig } from '../utils/llm';
-import { estimateCost } from '../utils/tokens';
+import { resolveCost } from '../utils/tokens';
 
 export interface AnswerResult {
   answer: string;
@@ -32,7 +32,7 @@ export async function generateAnswer(
   const client = createLlmClient(llmConfig);
   const startTime = Date.now();
 
-  const { text, inputTokens, outputTokens } = await client.complete({
+  const { text, inputTokens, outputTokens, costUsd } = await client.complete({
     model,
     maxTokens,
     system: SYSTEM_PROMPT,
@@ -45,7 +45,7 @@ export async function generateAnswer(
     answer: text,
     inputTokens,
     outputTokens,
-    cost: estimateCost(model, inputTokens, outputTokens),
+    cost: resolveCost(model, inputTokens, outputTokens, costUsd),
     responseTimeMs,
   };
 }
@@ -66,7 +66,7 @@ export async function generateAnswerStreaming(
   const client = createLlmClient(llmConfig);
   const startTime = Date.now();
 
-  const { text, inputTokens, outputTokens } = await client.streamComplete({
+  const { text, inputTokens, outputTokens, costUsd } = await client.streamComplete({
     model,
     maxTokens,
     system: SYSTEM_PROMPT,
@@ -79,7 +79,7 @@ export async function generateAnswerStreaming(
     answer: text,
     inputTokens,
     outputTokens,
-    cost: estimateCost(model, inputTokens, outputTokens),
+    cost: resolveCost(model, inputTokens, outputTokens, costUsd),
     responseTimeMs,
   };
 }

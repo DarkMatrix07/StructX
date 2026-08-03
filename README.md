@@ -2,9 +2,9 @@
 
 **Graph-powered code intelligence for TypeScript.** Drop into any project and your AI agent (Claude Code, Cursor, Copilot, Continue, Cline) gets a function-level knowledge graph instead of grepping raw files. Queries that took several file reads collapse into a single millisecond-latency call.
 
-[![npm](https://img.shields.io/npm/v/structx.svg)](https://www.npmjs.com/package/structx) [![license](https://img.shields.io/npm/l/structx.svg)](#license) [![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)](#contributing)
+[![npm](https://img.shields.io/npm/v/structx.svg)](https://www.npmjs.com/package/structx) [![license](https://img.shields.io/npm/l/structx.svg)](#license) [![tests](https://img.shields.io/badge/tests-103%20passing-brightgreen)](#contributing)
 
-> **v3.1.0 just shipped — first release with the full MCP server (12 tools), watch mode, dead-code finder, streaming `ask`, and Gemini provider support.** See [CHANGELOG.md](./CHANGELOG.md) for the full diff from 3.0.x.
+> **v3.4.0 just shipped — `structx path` traces a request from endpoint to database, `structx query` filters functions by what they *do*, and the call graph is now resolved through the TypeScript compiler instead of by name.** See [CHANGELOG.md](./CHANGELOG.md) for the full diff from 3.3.x.
 
 ```
 agent: "what breaks if I change validateEmail?"
@@ -53,6 +53,7 @@ For MCP-aware editors (Claude Desktop, Cursor, Continue, Cline), add the [MCP in
   - [Editor configs](#editor-configs)
   - [Readonly mode](#readonly-mode)
   - [Streaming `structx_ask`](#streaming-structx_ask)
+- [Route coverage](#route-coverage)
 - [CLI reference](#cli-reference)
 - [Watch mode](#watch-mode)
 - [Architecture](#architecture)
@@ -78,7 +79,7 @@ npm install -g structx
 Verify:
 
 ```bash
-structx --version    # → 3.1.0
+structx --version    # → 3.4.0
 ```
 
 If `structx` isn't found, your npm global bin isn't on PATH. Run `npm config get prefix` to see where global packages live and add `<prefix>/bin` (Unix) or `<prefix>` (Windows) to PATH.
@@ -196,7 +197,7 @@ Two patterns:
 
 #### Shared / read-only deployments
 
-Add `--readonly` to the args. The MCP server opens the DB read-only and disables `structx_ask` (which writes cache + run logs). Other 11 tools work normally — perfect for shared dev environments where you only want consumers, not writers:
+Add `--readonly` to the args. The MCP server opens the DB read-only and disables `structx_ask` (which writes cache + run logs). The other 15 tools work normally — perfect for shared dev environments where you only want consumers, not writers:
 
 ```json
 "args": ["mcp", "--repo", "/path/to/repo", "--readonly"]
@@ -204,13 +205,15 @@ Add `--readonly` to the args. The MCP server opens the DB read-only and disables
 
 ### Step 4 — Verify it loaded
 
-**Claude Desktop:** open a new chat, click the **🔌 plug icon** at the bottom of the message box. You should see `structx` listed with **12 tools**:
+**Claude Desktop:** open a new chat, click the **🔌 plug icon** at the bottom of the message box. You should see `structx` listed with **16 tools**:
 
 ```
 structx_search          structx_function       structx_relationships
-structx_impact          structx_route          structx_type
-structx_file            structx_list           structx_overview
-structx_costs           structx_dead_code      structx_ask
+structx_impact          structx_path           structx_query
+structx_route           structx_type           structx_file
+structx_list            structx_overview       structx_costs
+structx_dead_code       structx_type_graph     structx_pr_impact
+structx_ask
 ```
 
 If StructX isn't there, open **Developer → Open MCP Logs** and look for spawn errors. The most common causes are:
@@ -232,6 +235,8 @@ You don't have to teach the agent anything special — it'll pick the right tool
 | *"How does authentication work in this codebase?"* | `structx_search` (broad mode) | 4–6 file reads |
 | *"List every route I have."* | `structx_list` (`entity: "routes"`) | 1–2 file reads |
 | *"Find dead exports I can delete."* | `structx_dead_code` | a manual audit |
+| *"How does a request get from the API to chargeCard?"* | `structx_path` | 4–8 file reads |
+| *"Which exported functions write to the database?"* | `structx_query` | a full-repo grep + read |
 
 You can also be explicit when you want to:
 
@@ -348,14 +353,16 @@ The server logs to **stderr** (stdout is reserved for MCP frames) and stays aliv
 
 ### Tool reference
 
-12 tools, all accept an optional `repo_path` to override the server default:
+16 tools, all accept an optional `repo_path` to override the server default:
 
 | Tool | What it returns | LLM cost |
 |------|-----------------|----------|
 | `structx_search` | Functions/types/routes/files/constants matching keywords (FTS5). Optional `scope` to limit kinds, `mode: "broad"` for cross-cutting concerns. | Free |
 | `structx_function` | Full details for one function: signature, location, callers, callees, side effects. `include_body: true` for source text. | Free |
 | `structx_relationships` | Direct callers (`direction: "callers"`) or callees (`"callees"`) of a function. | Free |
-| `structx_impact` | Direct + transitive callers via recursive CTE. Bodies included for results ≤ 8. | Free |
+| `structx_impact` | Direct + transitive callers via recursive CTE, plus the HTTP endpoints whose handlers sit in the blast radius. Bodies included for results ≤ 8. | Free |
+| `structx_path` | Trace the call chain between two functions (`from` + `to`), or from every HTTP endpoint that reaches a function (`to` only). Depth-capped, cycle-safe. | Free |
+| `structx_query` | Filter functions by semantic properties — `domain`, `side_effect`, `complexity`, `exported`, `is_async`, `name_pattern`, `file_pattern`. Call with no filters to list available domains. | Free |
 | `structx_route` | HTTP routes by path/method. `path_match: "exact"` to avoid substring hits. | Free |
 | `structx_type` | Type/interface/enum by name. Falls back to FTS + identifier-tokenized fuzzy match. | Free |
 | `structx_file` | File overview (functions/types/routes/constants). Empty path = all files. | Free |
@@ -431,6 +438,27 @@ When an MCP client passes an `onprogress` callback to `callTool` (the SDK attach
 
 ---
 
+## Route coverage
+
+StructX finds HTTP endpoints across the three conventions in common use, and
+links each one to the function that handles it — which is what lets
+`structx path` trace an endpoint down to the data layer:
+
+| Style | Example | Framework |
+|---|---|---|
+| Call registration | `router.get('/users', handler)` | Express, Koa, Fastify |
+| Inline handler | `router.post('/login', async (req, res) => {...})` | Express (most common) |
+| Decorators | `@Controller('users')` + `@Get(':id')` | NestJS, Tsoa, routing-controllers |
+| File-based | `app/api/users/[id]/route.ts` exporting `GET` | Next.js App Router, SvelteKit, Medusa v2 |
+| Pages API | `pages/api/users/[id].ts` default export | Next.js Pages Router |
+| Components | `@Component({ tag })`, `@customElement()` | Stencil, Lit, Angular |
+
+Verified against real repositories: 281/281 routes linked on immich, 174/174
+on NestJS, 20/21 on a stock Express app (the one miss mounts a sub-router
+rather than a handler).
+
+---
+
 ## CLI reference
 
 | Command | Description |
@@ -443,10 +471,29 @@ When an MCP client passes an `onprogress` callback to `callTool` (the SDK attach
 | `structx analyze [repo] --yes` | Run semantic analysis on new/changed functions |
 | `structx status` | Show graph stats (files, functions, relationships, etc.) |
 | `structx overview --repo .` | Full codebase summary, no API key needed |
+| `structx path <to> [--from <fn>]` | Trace the call chain to a function — from another function, or from every HTTP endpoint that reaches it |
+| `structx query [filters]` | Filter functions by domain, side effect, complexity, name or file. No filters = list available domains |
 | `structx ask "..." --repo .` | Natural-language query against the graph |
 | `structx mcp --repo . [--readonly]` | Run the MCP server over stdio |
 | `structx doctor` | Validate environment, config, and DB |
 | `structx benchmark run --repo .` | StructX vs file-reading benchmark |
+
+```bash
+# How does a request reach the payment code?
+structx path chargeCard
+
+# POST /orders/checkout
+#   OrdersController.checkout   [src/orders.controller.ts:7]
+#     └─ processPayment         [src/service.ts:4]
+#       └─ chargeCard           [src/repository.ts:2]
+
+# Every exported database function that writes
+structx query --domain database --side-effect write --exported
+```
+
+`structx path` accepts `--max-depth` (default 8) and `--limit` (default 5).
+
+`structx query` filters on `--domain`, `--complexity`, `--side-effect`, `--exported`, `--async`, `--name`, `--file`. The structural filters work without semantic analysis; the semantic ones need `structx analyze` to have run.
 
 `structx ask` accepts `--max-tokens 64..8192` to bound the answer cost.
 
@@ -510,7 +557,7 @@ Run `structx watch` in one terminal and `structx mcp` in another (Claude Desktop
                                           │
                                ┌──────────┴──────────┐
                                │  CLI    │   MCP     │
-                               │  ask    │   12 tools│
+                               │  ask    │   16 tools│
                                └─────────┴───────────┘
 ```
 
@@ -608,12 +655,12 @@ Watch mode end-to-end latency (file save → DB visible to readers): **~160 ms m
 
 ## Status
 
-**v3.1.0 — published on npm.**
+**v3.4.0 — published on npm.**
 
 Strong:
-- 12 MCP tools, strict schemas, three providers, streaming, multi-repo, readonly
+- 16 MCP tools, strict schemas, three providers, streaming, multi-repo, readonly
 - Graph-fingerprint cache invalidation, watch mode with batched flush, dead-code finder
-- 55 tests including end-to-end MCP via `InMemoryTransport`
+- 103 tests including end-to-end MCP via `InMemoryTransport`
 - p50 4 ms tool latency on warm connection
 
 Honest gaps:

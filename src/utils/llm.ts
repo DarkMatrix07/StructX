@@ -31,6 +31,13 @@ export interface LlmCompleteResponse {
   text: string;
   inputTokens: number;
   outputTokens: number;
+  // Exact charge for this call, when the provider reports one. OpenRouter
+  // returns `usage.cost` on every response (streaming included), which beats
+  // estimating from a local price table — that table cannot know the hundreds
+  // of models OpenRouter routes to, and silently fell back to $1/$5 per M,
+  // overstating a real mistral-small run by ~37x. Undefined for providers
+  // that do not report cost; callers fall back to estimateCost then.
+  costUsd?: number;
 }
 
 export interface LlmClient {
@@ -152,10 +159,12 @@ class OpenRouterClient implements LlmClient {
     });
 
     const text = response.choices[0]?.message?.content ?? '';
+    const reportedCost = (response.usage as { cost?: number } | undefined)?.cost;
     return {
       text,
       inputTokens: response.usage?.prompt_tokens ?? 0,
       outputTokens: response.usage?.completion_tokens ?? 0,
+      ...(typeof reportedCost === 'number' ? { costUsd: reportedCost } : {}),
     };
   }
 
@@ -180,6 +189,7 @@ class OpenRouterClient implements LlmClient {
     let fullText = '';
     let inputTokens = 0;
     let outputTokens = 0;
+    let costUsd: number | undefined;
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta?.content ?? '';
       if (delta) {
@@ -189,10 +199,13 @@ class OpenRouterClient implements LlmClient {
       if (chunk.usage) {
         inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
         outputTokens = chunk.usage.completion_tokens ?? outputTokens;
+        // Exactly one frame in the stream carries usage; it includes cost.
+        const reported = (chunk.usage as { cost?: number }).cost;
+        if (typeof reported === 'number') costUsd = reported;
       }
     }
 
-    return { text: fullText, inputTokens, outputTokens };
+    return { text: fullText, inputTokens, outputTokens, ...(costUsd !== undefined ? { costUsd } : {}) };
   }
 }
 

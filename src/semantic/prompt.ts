@@ -33,12 +33,25 @@ Respond ONLY with a JSON array, no markdown, no explanation:
   {
     "function_name": "exact_name_from_above",
     "purpose": "One sentence describing what this function does",
-    "side_effects": ["list of side effects like DB writes, network calls, console output"],
+    "side_effects": ["zero or more of the exact tags listed below"],
     "behavior": "2-3 sentence description of how the function works step by step",
     "domain": "one of: authentication, database, validation, routing, middleware, utility, logging, session, crypto, ui, api, config, testing, other",
     "complexity": "low | medium | high"
   }
-]`;
+]
+
+side_effects MUST use only these exact tags, lowercase, no other wording:
+  db_read      reads from a database or persistent store
+  db_write     inserts, updates or deletes persisted data
+  network      outbound HTTP/RPC/socket call to another service
+  filesystem   reads or writes files
+  console      writes to stdout/stderr (console.log and friends)
+  response     writes to an HTTP response object
+  cache        reads or writes an in-memory or external cache
+  state        mutates module-level or shared state
+  process      spawns processes, exits, or alters environment
+Use [] when the function is pure. Only report an effect the function
+performs ITSELF — not effects that happen inside functions it calls.`;
 }
 
 export interface PromptType {
@@ -139,7 +152,11 @@ export function hashPrompt(prompt: string): string {
 }
 
 // Bump when the function-analysis prompt template or schema changes so old cache entries are skipped.
-export const FUNCTION_PROMPT_VERSION = 'v1';
+// v2 (3.4.0): side_effects moved from free text to a closed tag vocabulary.
+// Cached v1 entries hold prose like "DB writes" / "Sends JSON response" which
+// `structx query --side-effect` cannot filter reliably, so they must not be
+// reused — functions re-analyze on the next `structx analyze` run.
+export const FUNCTION_PROMPT_VERSION = 'v2';
 
 // Per-function cache key — independent of batch composition.
 // Same function code + model + prompt version = same cache hit, regardless of which other

@@ -218,7 +218,16 @@ export interface RelationshipRow {
   caller_function_id: number;
   callee_function_id: number | null;
   callee_name: string;
+  callee_decl_file: string | null;
+  callee_decl_name: string | null;
   relation_type: string;
+}
+
+// Declaration site resolved by the type checker, stored so the post-ingest
+// pass can bind exactly even when the callee's file is ingested later.
+export interface CalleeDeclaration {
+  file: string;   // repo-relative, forward slashes
+  name: string;
 }
 
 export function insertRelationship(
@@ -226,12 +235,18 @@ export function insertRelationship(
   callerFunctionId: number,
   calleeName: string,
   relationType: string,
-  calleeFunctionId?: number
+  calleeFunctionId?: number,
+  decl?: CalleeDeclaration,
 ): void {
   db.prepare(`
-    INSERT OR IGNORE INTO relationships (caller_function_id, callee_function_id, callee_name, relation_type)
-    VALUES (?, ?, ?, ?)
-  `).run(callerFunctionId, calleeFunctionId ?? null, calleeName, relationType);
+    INSERT OR IGNORE INTO relationships
+      (caller_function_id, callee_function_id, callee_name, callee_decl_file, callee_decl_name, relation_type)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    callerFunctionId, calleeFunctionId ?? null, calleeName,
+    decl ? normalizeRepoPath(decl.file) : null, decl?.name ?? null,
+    relationType,
+  );
 }
 
 export function getCallees(db: Database.Database, callerFunctionId: number): RelationshipRow[] {
@@ -418,6 +433,22 @@ export interface DeadFunction {
 // callee_function_id = its id, AND no rows where callee_name = its name.
 // The OR-NOT-EXISTS pair handles both resolved and unresolved relationships.
 export function getDeadFunctions(db: Database.Database, limit: number = 50): DeadFunction[] {
+  // Route handlers are reachable by definition — an HTTP request is an inbound
+  // reference the call graph cannot see. Without this exclusion, every inline
+  // Express handler (which by construction has no caller) would be reported as
+  // "internal, almost certainly safe to remove". Deleting your API on that
+  // advice is the worst failure mode this tool has.
+  let routeHandlerFilter = '';
+  try {
+    db.prepare('SELECT handler_function_id FROM routes LIMIT 1').get();
+    routeHandlerFilter = `
+      AND NOT EXISTS (
+        SELECT 1 FROM routes rt WHERE rt.handler_function_id = f.id
+      )`;
+  } catch {
+    // Pre-3.4 database without the column — fall back to the old behavior.
+  }
+
   const rows = db.prepare(`
     SELECT f.id, f.name, files.path as filePath, f.start_line, f.is_exported,
            f.signature, f.purpose
@@ -428,7 +459,7 @@ export function getDeadFunctions(db: Database.Database, limit: number = 50): Dea
     )
     AND NOT EXISTS (
       SELECT 1 FROM relationships r WHERE r.callee_name = f.name
-    )
+    )${routeHandlerFilter}
     ORDER BY f.is_exported DESC, files.path, f.start_line
     LIMIT ?
   `).all(limit) as DeadFunction[];
@@ -603,6 +634,47 @@ export function getStats(db: Database.Database): Stats {
 // ── Callee resolution ──
 
 export function resolveNullCallees(db: Database.Database): number {
+  // Pass 0 — type-checker resolution (v3.4.0). When the ingester recorded a
+  // declaration site, bind to the function in THAT file with THAT name. This
+  // runs first and, unlike the passes below, overwrites an existing binding:
+  // a checker-resolved target is exact, while a name match is a guess that
+  // can land on the wrong same-named function in another file.
+  //
+  // Deliberately not restricted to `callee_function_id IS NULL` for that
+  // reason. The `IS NOT (SELECT ...)` guard keeps the row count honest by
+  // only counting rows whose binding actually changes.
+  let declChanges = 0;
+  try {
+    const declResolved = db.prepare(`
+      UPDATE relationships
+         SET callee_function_id = (
+           SELECT f.id FROM functions f
+             JOIN files fl ON fl.id = f.file_id
+            WHERE fl.path = relationships.callee_decl_file
+              AND f.name = relationships.callee_decl_name
+            LIMIT 1
+         )
+       WHERE callee_decl_file IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM functions f
+             JOIN files fl ON fl.id = f.file_id
+            WHERE fl.path = relationships.callee_decl_file
+              AND f.name = relationships.callee_decl_name
+         )
+         AND callee_function_id IS NOT (
+           SELECT f.id FROM functions f
+             JOIN files fl ON fl.id = f.file_id
+            WHERE fl.path = relationships.callee_decl_file
+              AND f.name = relationships.callee_decl_name
+            LIMIT 1
+         )
+    `).run();
+    declChanges = declResolved.changes;
+  } catch {
+    // Older database without the v3.4.0 columns — fall through to the
+    // name-based passes, which is exactly the pre-3.4 behavior.
+  }
+
   // Pass 1: bind NULL relationships when the callee name matches exactly
   // one function. Ambiguous names are left NULL so impact analysis doesn't
   // return false positives for unrelated same-named functions.
@@ -643,7 +715,7 @@ export function resolveNullCallees(db: Database.Database): number {
        ) = 1
   `).run();
 
-  return exact.changes + suffix.changes;
+  return declChanges + exact.changes + suffix.changes;
 }
 
 // ── Impact analysis (recursive CTE) ──
@@ -676,6 +748,193 @@ export function getTransitiveCallersRobust(db: Database.Database, functionId: nu
     SELECT DISTINCT f.* FROM functions f
     JOIN callers c ON f.id = c.id
   `).all(functionId, functionName) as FunctionRow[];
+}
+
+// ── Call-path search ──
+
+export interface CallPathStep {
+  id: number;
+  name: string;
+  filePath: string;
+  start_line: number;
+  purpose: string | null;
+}
+
+export interface CallPath {
+  depth: number;
+  steps: CallPathStep[];
+}
+
+// Find call chains from one function to another: "how does placeOrder reach
+// chargeCard?". Answers the question a caller/callee list cannot — the route
+// between two points, not just one hop.
+//
+// Implemented as a recursive CTE that carries the visited path as a string so
+// cycles terminate (`instr` guard) without a second traversal. Depth is capped
+// because a call graph of any size explodes combinatorially, and paths beyond
+// a handful of hops stop being explanatory anyway.
+//
+// Only resolved edges (callee_function_id NOT NULL) are traversed, which is
+// exactly why 3.4.0's type resolution matters here: every edge name matching
+// left unbound was a path this search could never have found.
+export function findCallPaths(
+  db: Database.Database,
+  fromName: string,
+  toName: string,
+  maxDepth: number = 8,
+  limit: number = 5,
+): CallPath[] {
+  const rows = db.prepare(`
+    WITH RECURSIVE walk(id, path, depth) AS (
+      SELECT id, CAST(id AS TEXT), 0
+        FROM functions WHERE name = ?
+      UNION ALL
+      SELECT r.callee_function_id,
+             w.path || ',' || r.callee_function_id,
+             w.depth + 1
+        FROM walk w
+        JOIN relationships r ON r.caller_function_id = w.id
+       WHERE r.relation_type = 'calls'
+         AND r.callee_function_id IS NOT NULL
+         AND w.depth < ?
+         AND INSTR(',' || w.path || ',', ',' || r.callee_function_id || ',') = 0
+    )
+    SELECT w.path AS path, w.depth AS depth
+      FROM walk w
+      JOIN functions f ON f.id = w.id
+     WHERE f.name = ? AND w.depth > 0
+     ORDER BY w.depth ASC
+     LIMIT ?
+  `).all(fromName, maxDepth, toName, limit) as Array<{ path: string; depth: number }>;
+
+  if (rows.length === 0) return [];
+
+  // Resolve every id mentioned by any path in one round-trip.
+  const ids = [...new Set(rows.flatMap(r => r.path.split(',').map(Number)))];
+  const placeholders = ids.map(() => '?').join(',');
+  const nodes = db.prepare(`
+    SELECT f.id, f.name, files.path AS filePath, f.start_line, f.purpose
+      FROM functions f JOIN files ON files.id = f.file_id
+     WHERE f.id IN (${placeholders})
+  `).all(...ids) as CallPathStep[];
+  const byId = new Map(nodes.map(n => [n.id, n]));
+
+  return rows.map(r => ({
+    depth: r.depth,
+    steps: r.path.split(',').map(Number).map(id => byId.get(id)).filter(Boolean) as CallPathStep[],
+  }));
+}
+
+// Entry points that reach a function: which HTTP endpoints can, transitively,
+// end up calling this? Pairs findCallPaths with route→handler links so the
+// answer starts at the API surface rather than at an arbitrary function.
+export interface RoutePath {
+  method: string;
+  path: string;
+  handlerName: string | null;
+  callPath: CallPathStep[];
+}
+
+export function findRoutePathsTo(
+  db: Database.Database,
+  toName: string,
+  maxDepth: number = 8,
+  limit: number = 10,
+): RoutePath[] {
+  const handlers = db.prepare(`
+    SELECT r.method, r.path, r.handler_name AS handlerName, f.name AS handlerFunction
+      FROM routes r JOIN functions f ON f.id = r.handler_function_id
+     ORDER BY r.path, r.method
+  `).all() as Array<{ method: string; path: string; handlerName: string | null; handlerFunction: string }>;
+
+  const results: RoutePath[] = [];
+  for (const handler of handlers) {
+    if (results.length >= limit) break;
+    // A handler that IS the target still counts as a one-step path.
+    if (handler.handlerFunction === toName) {
+      const self = db.prepare(`
+        SELECT f.id, f.name, files.path AS filePath, f.start_line, f.purpose
+          FROM functions f JOIN files ON files.id = f.file_id
+         WHERE f.name = ? LIMIT 1
+      `).get(toName) as CallPathStep | undefined;
+      if (self) results.push({ ...handler, callPath: [self] });
+      continue;
+    }
+    const paths = findCallPaths(db, handler.handlerFunction, toName, maxDepth, 1);
+    if (paths.length > 0) results.push({ ...handler, callPath: paths[0].steps });
+  }
+  return results;
+}
+
+// ── Semantic query ──
+
+export interface SemanticQueryFilters {
+  domain?: string;
+  complexity?: string;
+  sideEffect?: string;      // substring match against side_effects_json
+  isExported?: boolean;
+  isAsync?: boolean;
+  namePattern?: string;     // SQL LIKE pattern, % wildcards allowed
+  filePattern?: string;
+  analyzedOnly?: boolean;   // only functions that have semantic metadata
+  limit?: number;
+}
+
+export interface SemanticQueryRow extends FunctionRow {
+  filePath: string;
+}
+
+// Structured search over the LLM-generated semantic fields. Before this, the
+// only way to reach `domain` / `side_effects_json` / `complexity` was to spend
+// tokens on a natural-language `ask` — the most expensive data in the graph
+// was effectively write-only. This turns it into an index.
+export function semanticQuery(db: Database.Database, filters: SemanticQueryFilters): SemanticQueryRow[] {
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (filters.domain) { where.push('f.domain = ?'); params.push(filters.domain); }
+  if (filters.complexity) { where.push('f.complexity = ?'); params.push(filters.complexity); }
+  if (filters.sideEffect) {
+    where.push('f.side_effects_json LIKE ?');
+    params.push(`%${filters.sideEffect}%`);
+  }
+  if (filters.isExported !== undefined) { where.push('f.is_exported = ?'); params.push(filters.isExported ? 1 : 0); }
+  if (filters.isAsync !== undefined) { where.push('f.is_async = ?'); params.push(filters.isAsync ? 1 : 0); }
+  if (filters.namePattern) { where.push('f.name LIKE ?'); params.push(filters.namePattern); }
+  if (filters.filePattern) { where.push('files.path LIKE ?'); params.push(filters.filePattern); }
+  if (filters.analyzedOnly) { where.push('f.semantic_analyzed_at IS NOT NULL'); }
+
+  const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(filters.limit ?? 50);
+
+  return db.prepare(`
+    SELECT f.*, files.path AS filePath
+      FROM functions f JOIN files ON files.id = f.file_id
+      ${clause}
+     ORDER BY f.is_exported DESC, files.path, f.start_line
+     LIMIT ?
+  `).all(...params) as SemanticQueryRow[];
+}
+
+// Distinct values actually present in the graph, so agents can discover what
+// is worth filtering on instead of guessing at the taxonomy.
+export function semanticFacets(db: Database.Database): {
+  domains: Array<{ value: string; count: number }>;
+  complexities: Array<{ value: string; count: number }>;
+  analyzed: number;
+  total: number;
+} {
+  const domains = db.prepare(`
+    SELECT domain AS value, COUNT(*) AS count FROM functions
+     WHERE domain IS NOT NULL GROUP BY domain ORDER BY count DESC
+  `).all() as Array<{ value: string; count: number }>;
+  const complexities = db.prepare(`
+    SELECT complexity AS value, COUNT(*) AS count FROM functions
+     WHERE complexity IS NOT NULL GROUP BY complexity ORDER BY count DESC
+  `).all() as Array<{ value: string; count: number }>;
+  const analyzed = (db.prepare('SELECT COUNT(*) c FROM functions WHERE semantic_analyzed_at IS NOT NULL').get() as { c: number }).c;
+  const total = (db.prepare('SELECT COUNT(*) c FROM functions').get() as { c: number }).c;
+  return { domains, complexities, analyzed, total };
 }
 
 // ── Type queries ──
@@ -889,6 +1148,7 @@ export interface RouteRow {
   method: string;
   path: string;
   handler_name: string | null;
+  handler_function_id: number | null;
   handler_body: string;
   middleware: string | null;
   start_line: number;
@@ -902,6 +1162,9 @@ export interface InsertRoute {
   method: string;
   path: string;
   handler_name: string | null;
+  // Set by the ingester when the handler resolves to a function in the same
+  // file; cross-file handlers are bound by resolveRouteHandlers afterwards.
+  handler_function_id?: number | null;
   handler_body: string;
   middleware: string | null;
   start_line: number;
@@ -910,10 +1173,71 @@ export interface InsertRoute {
 
 export function insertRoute(db: Database.Database, r: InsertRoute): number {
   const result = db.prepare(`
-    INSERT INTO routes (file_id, method, path, handler_name, handler_body, middleware, start_line, end_line)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(r.file_id, r.method, r.path, r.handler_name, r.handler_body, r.middleware, r.start_line, r.end_line);
+    INSERT INTO routes (file_id, method, path, handler_name, handler_function_id, handler_body, middleware, start_line, end_line)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    r.file_id, r.method, r.path, r.handler_name, r.handler_function_id ?? null,
+    r.handler_body, r.middleware, r.start_line, r.end_line,
+  );
   return Number(result.lastInsertRowid);
+}
+
+// Bind routes to their handler functions across files. Runs in the post-ingest
+// pass, after every file's functions exist, so a route declared in routes.ts
+// can reach a handler defined in controllers/user.ts.
+//
+// Two rules, both conservative in the same way callee resolution is:
+//   1. Prefer a handler defined in the route's own file (the common case for
+//      `@Controller` classes and colocated Express handlers).
+//   2. Otherwise bind only when the name is unique repo-wide — an ambiguous
+//      `handleRequest` in four files stays NULL rather than pointing at a
+//      coin-flip.
+export function resolveRouteHandlers(db: Database.Database): number {
+  try {
+    const sameFile = db.prepare(`
+      UPDATE routes
+         SET handler_function_id = (
+           SELECT f.id FROM functions f
+            WHERE f.file_id = routes.file_id AND f.name = routes.handler_name
+            LIMIT 1
+         )
+       WHERE handler_function_id IS NULL
+         AND handler_name IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM functions f
+            WHERE f.file_id = routes.file_id AND f.name = routes.handler_name
+         )
+    `).run();
+
+    const uniqueGlobal = db.prepare(`
+      UPDATE routes
+         SET handler_function_id = (
+           SELECT f.id FROM functions f WHERE f.name = routes.handler_name LIMIT 1
+         )
+       WHERE handler_function_id IS NULL
+         AND handler_name IS NOT NULL
+         AND (SELECT COUNT(*) FROM functions f WHERE f.name = routes.handler_name) = 1
+    `).run();
+
+    return sameFile.changes + uniqueGlobal.changes;
+  } catch {
+    return 0;
+  }
+}
+
+// Routes whose handler is one of the given functions. This is the payoff of
+// handler linking: impact analysis collects the transitive caller set, then
+// asks which of those callers are HTTP entry points.
+export function getRoutesByHandlerFunctionIds(db: Database.Database, functionIds: number[]): RouteRow[] {
+  if (functionIds.length === 0) return [];
+  try {
+    const placeholders = functionIds.map(() => '?').join(',');
+    return db.prepare(
+      `SELECT * FROM routes WHERE handler_function_id IN (${placeholders}) ORDER BY path, method`
+    ).all(...functionIds) as RouteRow[];
+  } catch {
+    return [];
+  }
 }
 
 export function getRoutesByFileId(db: Database.Database, fileId: number): RouteRow[] {

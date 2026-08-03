@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { extractTypes, type ExtractedType } from './type-extractor';
-import { extractRoutes, type ExtractedRoute } from './route-extractor';
+import { extractRoutes, findInlineRouteHandlers, type ExtractedRoute } from './route-extractor';
 import { extractConstants, type ExtractedConstant } from './constant-extractor';
 import { extractFileMetadata, type ExtractedFileMetadata } from './file-metadata';
 import { logger } from '../utils/logger';
@@ -214,6 +214,50 @@ export function parseFile(project: Project, filePath: string): ExtractedFunction
   return functions;
 }
 
+// CommonJS exports: `exports.foo = function () {}`, `module.exports.foo = () => {}`,
+// and `module.exports = function foo() {}`. These are the dominant way older
+// JavaScript codebases declare their public functions — Express, for example,
+// yielded 11 functions from 141 files before this, because none of its
+// `exports.x = function` declarations matched any extractor. `.js` has always
+// been in TS_EXTENSIONS, so the support was implied but not real.
+function extractCommonJsExports(sourceFile: SourceFile): ExtractedFunction[] {
+  const functions: ExtractedFunction[] = [];
+
+  for (const statement of sourceFile.getStatements()) {
+    if (!Node.isExpressionStatement(statement)) continue;
+    const expression = statement.getExpression();
+    if (!Node.isBinaryExpression(expression)) continue;
+    if (expression.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) continue;
+
+    const left = expression.getLeft();
+    if (!Node.isPropertyAccessExpression(left)) continue;
+
+    // Accept `exports.foo` and `module.exports.foo`; skip deeper paths.
+    const receiver = left.getExpression().getText();
+    if (receiver !== 'exports' && receiver !== 'module.exports') continue;
+
+    const right = expression.getRight();
+    if (!Node.isArrowFunction(right) && !Node.isFunctionExpression(right)) continue;
+
+    const name = left.getName();
+    const params = right.getParameters().map(p => p.getText()).join(', ');
+    const body = statement.getFullText();
+
+    functions.push({
+      name,
+      signature: `${receiver}.${name} = (${params}) => unknown`,
+      body,
+      startLine: statement.getStartLineNumber(),
+      endLine: statement.getEndLineNumber(),
+      isExported: true,
+      isAsync: right.isAsync(),
+      codeHash: hashCode(body),
+    });
+  }
+
+  return functions;
+}
+
 function extractFunctionDeclaration(fn: FunctionDeclaration): ExtractedFunction | null {
   const name = fn.getName();
   if (!name) return null; // Skip anonymous functions
@@ -295,8 +339,12 @@ export interface ParseFileCompleteResult {
   fileMetadata: ExtractedFileMetadata;
 }
 
-export function parseFileComplete(project: Project, filePath: string): ParseFileCompleteResult {
-  const sourceFile = project.addSourceFileAtPath(filePath);
+// Parse a file that is already loaded into the project. Splitting this from
+// `parseFileComplete` lets the ingester add a source file once and hand the
+// same AST to both the entity extractor and the relationship extractor —
+// previously every file was read and parsed from disk twice per ingest, which
+// measured as roughly 80% of the wall time on a 3,763-file monorepo.
+export function parseSourceFile(sourceFile: SourceFile): ParseFileCompleteResult {
   const functions: ExtractedFunction[] = [];
 
   // Extract top-level function declarations
@@ -329,16 +377,46 @@ export function parseFileComplete(project: Project, filePath: string): ParseFile
     }
   }
 
+  // CommonJS `exports.foo = function` declarations (JavaScript codebases).
+  functions.push(...extractCommonJsExports(sourceFile));
+
+  // Inline route handlers — `router.get('/x', async (req, res) => {...})`.
+  // Surfaced as functions named `GET /x` so the route can link to them and
+  // their calls become real edges. `isExported` is true because they are
+  // reachable entry points, even though no `export` keyword appears.
+  for (const handler of findInlineRouteHandlers(sourceFile)) {
+    const body = handler.node.getFullText();
+    functions.push({
+      name: handler.name,
+      signature: `${handler.name} (${handler.params})`,
+      body,
+      startLine: handler.startLine,
+      endLine: handler.endLine,
+      isExported: true,
+      isAsync: handler.isAsync,
+      codeHash: hashCode(body),
+    });
+  }
+
   // Extract new entity types
   const types = extractTypes(sourceFile);
   const routes = extractRoutes(sourceFile);
   const constants = extractConstants(sourceFile);
   const fileMetadata = extractFileMetadata(sourceFile, functions.length, types.length, routes.length);
 
-  // Remove the source file from project to prevent memory bloat
-  project.removeSourceFile(sourceFile);
-
   return { functions, types, routes, constants, fileMetadata };
+}
+
+// Path-based entry point: adds the file, parses it, and drops it again.
+// Retained for callers that only need entities (tests, one-off tooling); the
+// ingester uses `parseSourceFile` so it can share one AST across extractors.
+export function parseFileComplete(project: Project, filePath: string): ParseFileCompleteResult {
+  const sourceFile = project.addSourceFileAtPath(filePath);
+  try {
+    return parseSourceFile(sourceFile);
+  } finally {
+    project.removeSourceFile(sourceFile);
+  }
 }
 
 export function hashFileContent(content: string): string {

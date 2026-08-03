@@ -8,8 +8,9 @@ import {
 import {
   getStats, getFullOverview,
   getCachedAskResponse, insertCachedAskResponse, insertQaRun,
-  getFunctionsByName, getCostStats, getDeadFunctions,
+  getFunctionsByName, getCostStats, getDeadFunctions, getFilePathsByIds,
   getSubtypesOf, getSupertypesOf,
+  findCallPaths, findRoutePathsTo, semanticQuery, semanticFacets,
 } from '../db/queries';
 import { classifyQuestionWithUsage } from '../query/classifier';
 import { buildContext } from '../query/context-builder';
@@ -112,6 +113,27 @@ const DeadCodeArgs = z.object({
 }).strict();
 const PrImpactArgs = z.object({
   ref: z.string().describe('Git ref to diff against. Common: "HEAD~1" (last commit), "main" (PR base), "<sha>" (specific commit).'),
+  response_mode: ResponseMode,
+  repo_path: RepoPath,
+}).strict();
+const PathArgs = z.object({
+  from: z.string().optional().describe('Starting function name. Omit and pass only `to` to search from every HTTP endpoint instead.'),
+  to: z.string().describe('Destination function name — the code you want to know how execution reaches.'),
+  max_depth: z.number().int().min(1).max(15).optional().describe('Maximum hops to traverse. Defaults to 8.'),
+  limit: z.number().int().min(1).max(25).optional().describe('Maximum distinct paths to return. Defaults to 5.'),
+  response_mode: ResponseMode,
+  repo_path: RepoPath,
+}).strict();
+const QueryArgs = z.object({
+  domain: z.string().optional().describe('Domain label, e.g. "database", "authentication", "validation". Call with no filters to see available values.'),
+  complexity: z.enum(['low', 'medium', 'high']).optional().describe('Complexity band assigned during semantic analysis.'),
+  side_effect: z.string().optional().describe('Substring match against recorded side effects, e.g. "write", "network", "console".'),
+  exported: z.boolean().optional().describe('Restrict to exported (true) or internal (false) functions.'),
+  is_async: z.boolean().optional().describe('Restrict to async (true) or synchronous (false) functions.'),
+  name_pattern: z.string().optional().describe('SQL LIKE pattern against the function name, e.g. "handle%".'),
+  file_pattern: z.string().optional().describe('SQL LIKE pattern against the file path, e.g. "src/auth/%".'),
+  analyzed_only: z.boolean().optional().describe('Only functions that have semantic metadata. Defaults to false.'),
+  limit: Limit,
   response_mode: ResponseMode,
   repo_path: RepoPath,
 }).strict();
@@ -306,11 +328,29 @@ function structuredContext(ctx: any, detail?: 'summary' | 'full'): any {
 
 function addFunctionBody(db: ReturnType<typeof getDb>, ctx: any, name: string, includeBody?: boolean): any {
   if (!includeBody || ctx.functions.length === 0) return ctx;
-  const rows = getFunctionsByName(db, name);
+
+  // Match bodies by name+location rather than array index. directLookup falls
+  // back to unqualified-name matching (`add` → `RegExpRouter.add`), in which
+  // case getFunctionsByName(name) returns nothing and index-zipping silently
+  // dropped every body. Look rows up by the resolved names instead.
+  const rows = [
+    ...getFunctionsByName(db, name),
+    ...ctx.functions.flatMap((fn: any) => (fn.name === name ? [] : getFunctionsByName(db, fn.name))),
+  ];
   if (rows.length === 0) return ctx;
+
+  const filePaths = getFilePathsByIds(db, rows.map(r => r.file_id));
+  const byLocation = new Map<string, string>();
+  for (const row of rows) {
+    byLocation.set(`${filePaths.get(row.file_id) ?? 'unknown'}:${row.start_line}`, row.body);
+  }
+
   return {
     ...ctx,
-    functions: ctx.functions.map((fn: any, i: number) => rows[i] ? { ...fn, body: rows[i].body } : fn),
+    functions: ctx.functions.map((fn: any) => {
+      const body = byLocation.get(fn.location);
+      return body ? { ...fn, body } : fn;
+    }),
   };
 }
 
@@ -426,7 +466,7 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
 
   // ── 4. structx_impact ──────────────────────────────────────────────────
   server.registerTool('structx_impact', {
-    description: 'Compute the transitive impact of changing a function: every direct and indirect caller via recursive traversal.',
+    description: 'Compute the transitive impact of changing a function: every direct and indirect caller via recursive traversal, plus the HTTP endpoints whose handlers sit in that blast radius.',
     inputSchema: ImpactArgs,
   }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
     const ctx = limitContext(impactAnalysis(db, args.name), args.limit);
@@ -693,7 +733,118 @@ export function registerTools(server: McpServer, defaultRepo: string): void {
     return toolResponse(lines.join('\n'), result, args.response_mode);
   }));
 
-  // ── 14. structx_ask ────────────────────────────────────────────────────
+  // ── 14. structx_path ───────────────────────────────────────────────────
+  server.registerTool('structx_path', {
+    description: 'Trace the call chain between two points in the graph — "how does execution get from here to there". With `from` and `to`, returns the call paths between two functions. With only `to`, returns the HTTP endpoints that reach it and the chain from each. Pure graph query — no LLM cost.',
+    inputSchema: PathArgs,
+  }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
+    const maxDepth = args.max_depth ?? 8;
+    const limit = args.limit ?? 5;
+
+    // Endpoint mode: no `from` given, so start at the API surface.
+    if (!args.from) {
+      const routePaths = findRoutePathsTo(db, args.to, maxDepth, limit);
+      const lines = [`# Endpoints reaching \`${args.to}\``, ''];
+      if (routePaths.length === 0) {
+        lines.push(`_No indexed HTTP endpoint reaches ${args.to} within ${maxDepth} hops._`);
+        lines.push('', 'This means either the function is not called from a route handler, or the handler is an inline arrow function (which has no indexed function row).');
+      }
+      for (const rp of routePaths) {
+        // Inline handlers are named after their route; don't repeat it.
+        const [first, ...rest] = rp.callPath;
+        const folded = first && first.name === `${rp.method} ${rp.path}`;
+        const steps = folded ? rest : rp.callPath;
+        lines.push(folded
+          ? `### ${rp.method} ${rp.path} \`${first.filePath}:${first.start_line}\``
+          : `### ${rp.method} ${rp.path}`);
+        lines.push(steps.map((s, i) => `${'  '.repeat(i)}${i > 0 ? '└─ ' : ''}**${s.name}** \`${s.filePath}:${s.start_line}\`${s.purpose ? ` — ${s.purpose}` : ''}`).join('\n'));
+        lines.push('');
+      }
+      return toolResponse(lines.join('\n'), { to: args.to, endpoints: routePaths }, args.response_mode);
+    }
+
+    const paths = findCallPaths(db, args.from, args.to, maxDepth, limit);
+    const lines = [`# Call paths: \`${args.from}\` → \`${args.to}\``, ''];
+    if (paths.length === 0) {
+      lines.push(`_No call path found within ${maxDepth} hops._`);
+      lines.push('', 'Either no such chain exists, or an edge along it is unresolved (external calls and ambiguous dynamic dispatch are not traversable).');
+    }
+    for (const p of paths) {
+      lines.push(`**${p.depth} hop${p.depth === 1 ? '' : 's'}:**`);
+      lines.push(p.steps.map((s, i) => `${'  '.repeat(i)}${i > 0 ? '└─ ' : ''}**${s.name}** \`${s.filePath}:${s.start_line}\`${s.purpose ? ` — ${s.purpose}` : ''}`).join('\n'));
+      lines.push('');
+    }
+    return toolResponse(lines.join('\n'), { from: args.from, to: args.to, paths }, args.response_mode);
+  }));
+
+  // ── 15. structx_query ──────────────────────────────────────────────────
+  server.registerTool('structx_query', {
+    description: 'Filter functions by their semantic properties — domain, side effects, complexity, export status — rather than by keyword. Answers questions like "every exported database function that writes" or "all high-complexity auth code". Requires `structx analyze` to have run. Call with no filters to discover which domains exist. Pure graph query — no LLM cost.',
+    inputSchema: QueryArgs,
+  }, async (args: any) => withDb(defaultRepo, args.repo_path, (db) => {
+    const hasFilter = ['domain', 'complexity', 'side_effect', 'exported', 'is_async', 'name_pattern', 'file_pattern']
+      .some(k => args[k] !== undefined);
+
+    // No filters: describe what is available instead of dumping the graph.
+    if (!hasFilter) {
+      const facets = semanticFacets(db);
+      const lines = [
+        '# Semantic index',
+        '',
+        `${facets.analyzed} of ${facets.total} functions have semantic metadata.`,
+      ];
+      if (facets.analyzed === 0) {
+        lines.push('', '_Run `structx analyze .` to populate domain, side-effect and complexity labels — this tool has nothing to filter until then._');
+      }
+      if (facets.domains.length > 0) {
+        lines.push('', '## Domains', ...facets.domains.map(d => `- **${d.value}** — ${d.count}`));
+      }
+      if (facets.complexities.length > 0) {
+        lines.push('', '## Complexity', ...facets.complexities.map(d => `- **${d.value}** — ${d.count}`));
+      }
+      return toolResponse(lines.join('\n'), facets, args.response_mode);
+    }
+
+    const rows = semanticQuery(db, {
+      domain: args.domain,
+      complexity: args.complexity,
+      sideEffect: args.side_effect,
+      isExported: args.exported,
+      isAsync: args.is_async,
+      namePattern: args.name_pattern,
+      filePattern: args.file_pattern,
+      analyzedOnly: args.analyzed_only,
+      limit: args.limit ?? 50,
+    });
+
+    const lines = [`# Matching functions: ${rows.length}`, ''];
+    for (const fn of rows) {
+      let sideEffects: string[] = [];
+      try { if (fn.side_effects_json) sideEffects = JSON.parse(fn.side_effects_json); } catch {}
+      const tags = [fn.domain, fn.complexity, fn.is_exported ? 'exported' : null, fn.is_async ? 'async' : null]
+        .filter(Boolean).join(' · ');
+      lines.push(`- **${fn.name}** \`${fn.filePath}:${fn.start_line}\`${tags ? `  _(${tags})_` : ''}`);
+      if (fn.purpose) lines.push(`    ${fn.purpose}`);
+      if (sideEffects.length > 0) lines.push(`    side effects: ${sideEffects.join(', ')}`);
+    }
+    if (rows.length === 0) lines.push('_No functions match those filters._');
+
+    return toolResponse(lines.join('\n'), {
+      count: rows.length,
+      functions: rows.map(fn => ({
+        name: fn.name,
+        location: `${fn.filePath}:${fn.start_line}`,
+        purpose: fn.purpose,
+        domain: fn.domain,
+        complexity: fn.complexity,
+        isExported: !!fn.is_exported,
+        isAsync: !!fn.is_async,
+        sideEffects: (() => { try { return fn.side_effects_json ? JSON.parse(fn.side_effects_json) : []; } catch { return []; } })(),
+      })),
+    }, args.response_mode);
+  }));
+
+  // ── 16. structx_ask ────────────────────────────────────────────────────
   server.registerTool('structx_ask', {
     description: readonly
       ? 'DISABLED in readonly mode. structx_ask writes to ask_cache and qa_runs. Restart the server without --readonly to enable.'

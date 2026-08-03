@@ -4,11 +4,15 @@ import type Database from 'better-sqlite3';
 import { createProject } from '../ingest/parser';
 import { ingestSingleFile, removeFileFromGraph } from '../ingest/ingester';
 import { ALWAYS_SKIP_DIRS, loadIgnoreMatcher, isIngestableTsFile } from '../ingest/scanner';
-import { resolveNullCallees, resolveTypeRelationships, rebuildAllFtsIndexes } from '../db/queries';
+import { resolveNullCallees, resolveTypeRelationships, resolveRouteHandlers, rebuildAllFtsIndexes } from '../db/queries';
 import { logger } from '../utils/logger';
 
 interface WatchOptions {
   diffThreshold: number;
+  // Mirrors the ingest option so incremental updates resolve call targets the
+  // same way a full ingest does — otherwise a watched edit would silently
+  // downgrade edges the initial scan had resolved precisely.
+  typeResolution?: boolean;
   // Time of quiet (no new events for any file) before a flush fires.
   quietMs?: number;
   // Maximum time to hold events from the first one in a burst before forcing
@@ -109,7 +113,9 @@ export async function watchDirectory(
               outcomes.push({ path: absPath, status: removed ? 'removed' : 'unchanged' });
               continue;
             }
-            const r = ingestSingleFile(db, project, repoPath, absPath, opts.diffThreshold);
+            const r = ingestSingleFile(db, project, repoPath, absPath, opts.diffThreshold, {
+              typeResolution: opts.typeResolution,
+            });
             outcomes.push({ path: absPath, status: r.status, result: r });
           } catch (err: any) {
             const rel = path.relative(repoPath, absPath).split(path.sep).join('/');
@@ -123,6 +129,7 @@ export async function watchDirectory(
       try {
         resolveNullCallees(db);
         resolveTypeRelationships(db);
+        resolveRouteHandlers(db);
         rebuildAllFtsIndexes(db);
       } catch (err: any) {
         logger.warn(`Post-process failed: ${err.message}`);

@@ -27,11 +27,19 @@ CREATE TABLE IF NOT EXISTS functions (
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- callee_decl_file / callee_decl_name record the declaration site the
+-- TypeScript type checker resolved the call to (repo-relative path + the
+-- name StructX stores that function under). They are NULL for external
+-- calls and for edges extracted without type resolution. The post-ingest
+-- resolver prefers them over name matching, because a checker-resolved
+-- target is exact where a name match is a guess.
 CREATE TABLE IF NOT EXISTS relationships (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   caller_function_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
   callee_function_id INTEGER REFERENCES functions(id) ON DELETE SET NULL,
   callee_name TEXT NOT NULL,
+  callee_decl_file TEXT,
+  callee_decl_name TEXT,
   relation_type TEXT NOT NULL,
   UNIQUE(caller_function_id, callee_name, relation_type)
 );
@@ -105,12 +113,17 @@ CREATE INDEX IF NOT EXISTS idx_type_relationships_subtype ON type_relationships(
 CREATE INDEX IF NOT EXISTS idx_type_relationships_supertype_id ON type_relationships(supertype_id);
 CREATE INDEX IF NOT EXISTS idx_type_relationships_supertype_name ON type_relationships(supertype_name);
 
+-- handler_function_id links a route to the functions row implementing it, so
+-- impact analysis can travel from a changed function up to the endpoints that
+-- expose it. NULL when the handler is inline (an anonymous arrow passed to
+-- app.get) or lives outside the indexed graph.
 CREATE TABLE IF NOT EXISTS routes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   method TEXT NOT NULL,
   path TEXT NOT NULL,
   handler_name TEXT,
+  handler_function_id INTEGER REFERENCES functions(id) ON DELETE SET NULL,
   handler_body TEXT NOT NULL,
   middleware TEXT,
   start_line INTEGER NOT NULL,
@@ -118,6 +131,11 @@ CREATE TABLE IF NOT EXISTS routes (
   purpose TEXT,
   semantic_analyzed_at DATETIME
 );
+-- NOTE: the index on handler_function_id is created in connection.ts, not
+-- here. This file is replayed on every open, including against databases
+-- created before 3.4.0 where CREATE TABLE IF NOT EXISTS is a no-op and the
+-- column therefore does not exist yet — indexing it here would abort the
+-- whole migration transaction for every upgrading user.
 
 CREATE TABLE IF NOT EXISTS constants (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

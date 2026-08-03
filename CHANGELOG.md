@@ -2,6 +2,285 @@
 
 All notable changes to StructX. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.4.0] — 2026-08-01
+
+### Added
+
+#### Call-path tracing — `structx path` / `structx_path`
+
+Trace how execution reaches a function, rather than listing one hop of
+callers at a time:
+
+```
+$ structx path ClientProxy.emit
+
+POST /
+  AdvancedGrpcController.call            [integration/.../advanced.grpc.controller.ts:37]
+    └─ ClientGrpcProxy.getService        [packages/microservices/client/client-grpc.ts:68]
+      └─ ClientGrpcProxy.createServiceMethod
+        └─ ClientGrpcProxy.createStreamServiceMethod
+          └─ ClientProxy.emit            [packages/microservices/client/client-proxy.ts:111]
+```
+
+With `--from` it finds the chains between two functions; without it, it
+starts from every HTTP endpoint that reaches the target — which is only
+possible because of the route→handler links added in this release. Depth is
+capped (default 8) and cycles terminate, so a recursive graph cannot hang
+the search.
+
+Pure graph query: no LLM cost, no API key.
+
+#### File-based routes (Next.js, SvelteKit, Medusa v2)
+
+Modern frameworks stopped registering routes with `app.get(...)`. They export
+verb-named functions from a file whose *path* is the URL, and StructX saw
+none of it — cal.com has 39 App Router `route.ts` and 46 `pages/api` files
+that produced zero routes, and Medusa v2 yielded 8 routes for an entire
+commerce platform.
+
+Route modules are now recognised by convention and their URL derived from
+the file path:
+
+| file | route |
+|---|---|
+| `app/api/users/[id]/route.ts` | `/api/users/:id` |
+| `app/(marketing)/api/leads/route.ts` | `/api/leads` |
+| `app/api/docs/[...slug]/route.ts` | `/api/docs/*` |
+| `pages/api/users/[id].ts` | `/api/users/:id` |
+| `src/routes/users/+server.ts` | `/users` |
+| `src/api/admin/orders/route.ts` | `/admin/orders` |
+
+Each exported `GET` / `POST` / … becomes a route whose handler is that
+function, so endpoint tracing works the same as it does for Express and
+NestJS. Next.js route groups `(marketing)` and private `_folders` are
+dropped since they do not appear in the URL, and `[...slug]` becomes `*`.
+A function named `GET` outside a route module stays an ordinary function.
+
+Note `api` is read differently per convention: under `app/` it is a real URL
+segment (Next.js), while `src/api/` is itself the routing root (Medusa).
+
+#### Inline Express route handlers are now part of the graph
+
+`router.get('/articles', async (req, res) => { ... })` — the dominant Express
+idiom — produced no function row in any prior version. The parser only
+extracted arrow functions assigned to a variable, so an Express app's entire
+controller layer was missing: no call edges, no impact analysis, nothing for
+a route to link to. On a real Express app (gothinkster/realworld), 0 of 21
+routes could be linked to a handler.
+
+Inline handlers are now extracted as functions named after the route they
+serve (`GET /articles`), which makes them ordinary graph nodes — they carry
+call edges, appear in search and impact analysis, and give `structx path`
+somewhere to start:
+
+```
+$ structx path login
+
+POST /users/login  [src/app/routes/auth/auth.controller.ts:30]
+  login            [src/app/routes/auth/auth.service.ts:84]
+```
+
+Same app, after: **20 of 21 routes linked** (the remaining one mounts a
+sub-router rather than a handler), functions 31 → 51, traversable nodes
+6 → 18. NestJS and hono graphs are byte-identical — decorator routes and
+libraries are unaffected.
+
+Two consequences worth knowing:
+
+- **Route handlers are excluded from dead-code analysis.** A handler has no
+  caller by construction — the inbound edge is an HTTP request the graph
+  cannot see. Reporting them as "internal, almost certainly safe to remove"
+  would have advised deleting the API.
+- **Calls inside a handler belong to the handler**, not to an enclosing
+  `registerRoutes()` that merely registers it.
+
+#### Semantic filtering — `structx query` / `structx_query`
+
+Filter functions by what they *do* instead of what they are called:
+
+```
+$ structx query --domain database --side-effect write --exported
+```
+
+Domain, side effects and complexity have been generated and stored for every
+analyzed function since 1.0, but the only way to reach them was a
+natural-language `ask` — the most expensive data in the graph was
+effectively write-only. This turns it into an index. Structural filters
+(`--name`, `--file`, `--exported`, `--async`) work without any analysis
+having run; calling with no filters reports which domains exist rather than
+dumping the graph.
+
+#### Type-resolved call graph
+
+Call edges are now resolved through the TypeScript type checker instead of by
+name alone. When a call site is reached, ts-morph is asked which declaration
+it actually targets — following imports, aliases, re-exports and method
+dispatch — and the declaration site is stored on the edge
+(`relationships.callee_decl_file` / `callee_decl_name`).
+
+This closes a correctness gap rather than adding a new query. Previously, a
+repo with two functions named `save` produced one of three outcomes: an
+unbound edge, or a bound edge chosen by whichever file was ingested first.
+The second case is the dangerous one — a confidently wrong edge that impact
+analysis then reports as fact. With resolution on, `import { save } from
+'./z-store'` binds to z-store's `save`, regardless of ingest order. There is
+a regression test asserting exactly that, including the wrong-binding
+behavior it replaces.
+
+Resolution is *sound about what it skips*: a declaration in repo source can
+only reach a call site through an import or a local declaration, so calls
+whose target is neither are never handed to the checker. That keeps
+`JSON.parse`, `.map`, and `db.prepare` out of the expensive path, and they
+stay unbound — which is correct, since they are not repo functions.
+
+The post-ingest resolver now runs the checker-resolved pass *first*, and it
+overwrites existing bindings. An exact target beats a name guess.
+
+Measured by ingesting four real repositories twice each — once with
+resolution, once without — and diffing the resulting graphs edge by edge:
+
+| repo | files | bound edges (name → checker) | edges corrected | regressions | ingest time |
+|---|---|---|---|---|---|
+| nest    | 972 | 1420 → 2478 (+1058) | 5 (0.4%) | 0 | 194s → 178s (−8%) |
+| zod     | 212 | 393 → 1035 (+642)   | 24 (6.1%) | 0 | 34.7s → 55.8s (+61%) |
+| hono    | 186 | 582 → 619 (+37)     | 8 (1.4%) | 0 | 11.5s → 33.5s (+191%) |
+| structx | 37  | 379 → 393 (+14)     | 0 | 0 | 15.2s → 23.2s (+53%) |
+
+"Edges corrected" are call edges where name matching bound to a *different*
+function than the checker — silently wrong edges in every prior version. zod
+is the clearest case: it vendors v3 and v4 side by side, so calls inside v3
+were binding into v4's identically-named files. No repo lost a single edge
+that name matching had bound (`regressions: 0`).
+
+Ingest cost varies with import-graph density rather than file count, from
+−8% to +191%; there is no single multiplier to quote. Set
+`"typeResolution": false` in `.structx/config.json` to fall back to the
+pre-3.4 name-based resolver.
+
+Be aware what that switch actually buys, though: on cal.com (3,763 files)
+ingest takes 3,012s with resolution and 2,416s without — the checker is only
+~20% of the cost, and the remaining 80% is the base parse. Disabling
+resolution is not a fix for slow ingest on a large monorepo; it costs 1,359
+bound edges (−19%) to save a fifth of the time.
+
+#### Routes linked to their handler functions
+
+`routes.handler_function_id` now points at the `functions` row implementing
+each endpoint, bound in-file during ingest and cross-file by the post-ingest
+`resolveRouteHandlers` pass (same-file first, then unique-name-only —
+ambiguous handlers stay NULL rather than guessing).
+
+The payoff is in impact analysis: `structx_impact` and `impactAnalysis()`
+now return the HTTP endpoints whose handlers sit in the blast radius, not
+just the calling functions. "What breaks if I change `validateSession`" now
+answers with `GET /users/:id`, which is usually the part that matters.
+Routes with inline arrow handlers have no function row and are unaffected.
+
+Verified against the NestJS repository: all 174 detected decorator routes
+linked to a handler, 174 distinct functions, zero name mismatches between
+the declared handler and the linked row.
+
+#### CommonJS export extraction
+
+`exports.foo = function () {}` and `module.exports.foo = () => {}` are now
+extracted as functions. `.js` has been in `TS_EXTENSIONS` since 3.0, but the
+extractors only recognised ES-module and class syntax — Express yielded 11
+functions from 141 files. Support is better, not complete: `require()` is
+still not an import declaration and prototype assignments
+(`app.get = function`) are still missed, so CommonJS call edges largely stay
+unbound.
+
+### Fixed
+
+- **Decorator applications were recorded as call edges.** On NestJS this made
+  `Body` look like the most depended-upon function in the repo, and
+  "what breaks if I change `Body`" answered with 58 endpoints. Decorators
+  describe how a framework wires a function up, not what it invokes; routes
+  are captured separately by the route extractor. Removing them dropped
+  nest's call-edge count from 5791 to 5261 and left the top handler
+  dependencies as real services.
+- **Any `.get('/…')` call was treated as an HTTP route.** A route
+  registration always passes a handler after the path, so single-argument
+  calls and calls whose last argument is a string are no longer routes. The
+  TypeScript compiler repo reported 29 phantom endpoints from
+  `map.get('/foo/bar')` in its test suite; it now reports 0, while nest's
+  174 genuine routes are unaffected.
+- **A locked graph crashed with a raw stack trace.** Running `structx ingest`
+  while `structx watch` holds the write lock produced an unhandled
+  `SqliteError: database is locked` dump that named neither the cause nor the
+  fix. Connections now wait up to 10s for a contended lock (WAL contention is
+  usually momentary), and a genuine conflict reports which process to stop.
+- **NestJS's `@Controller({ path: '...' })` options form was not read.** Only
+  the string and enum-member forms were handled, so controllers using the
+  officially supported options object lost their base path entirely: on
+  cal.com's v2 API, 21% of routes collapsed to `/` and the rest surfaced as
+  bare fragments like `/:webhookId`. Now 0% collapse, and paths resolve in
+  full (`GET /v2/atoms/auth/oauth2/clients/:clientId`). Array paths
+  (`path: ['a', 'b']`) take the first entry.
+- **`--provider gemini` was silently ignored.** CLI validation accepted only
+  anthropic and openrouter in all six branches, so the flag fell through to
+  whatever config or env specified, despite Gemini being fully supported.
+- **Cost telemetry now uses the provider's own figure when it reports one.**
+  OpenRouter returns an exact `usage.cost` on every response — streaming
+  included — and StructX ignored it in favour of a local price table that
+  cannot know the hundreds of models OpenRouter routes to. An unknown model
+  fell through to a $1/$5-per-M placeholder: a real `mistral-small` analyze
+  run reported **$0.0054 against an actual charge of ~$0.00015, a 37x
+  overstatement**. Verified end-to-end against the live API; the same run now
+  reports $0.0001. `estimateCost` remains the fallback for providers that do
+  not report cost (Anthropic, Gemini).
+- **OpenRouter runs were mispriced.** `anthropic/claude-haiku-4.5` and
+  `anthropic/claude-sonnet-4.5` — the models `OPENROUTER_DEFAULTS` actually
+  selects — were absent from the pricing table, so every default OpenRouter
+  run fell through to a generic $1/$5 estimate and `structx_costs` reported
+  fiction.
+- **`structx analyze` ignored fatal provider errors.** `setup` has always
+  stopped on a 402/401; `analyze` dropped the abort flag and kept issuing
+  doomed requests, then reported a large "Failed: N" with no reason.
+- **`include_body` silently did nothing for fuzzy matches.** `structx_function`
+  zipped bodies to results by array index against a lookup that returns
+  nothing when the name resolved via the unqualified fallback (`add` →
+  `RegExpRouter.add`). Bodies are now matched by location.
+- `vitest run` collected the full repo copies under `.claude/worktrees/`,
+  running four stale versions of the suite alongside the real one (41 files
+  / 214 tests instead of 13 / 74). Those copies passed against old code and
+  would have masked regressions in `src/`.
+
+### Not changed, and why
+
+**Ingest still parses every file twice** — once for entities, once for call
+relationships. Sharing a single AST between the two extractors is the obvious
+optimization and it was implemented, measured, and reverted: on nest it made
+ingest 23% slower (205s → 253s) and doubled peak heap (410MB → 819MB).
+
+The redundant parse turns out to be load-bearing. Each `removeSourceFile`
+invalidates ts-morph's `Program`, which evicts the transitive dependency
+graph the type checker pulls in while resolving call targets. Holding one
+AST across both extractors removes that eviction, so the `Program` grows for
+the whole run and every later checker query pays for it. Re-parsing a file
+is cheaper than the memory that eviction reclaims.
+
+Large-monorepo ingest is therefore still slow (cal.com: ~50 minutes) and no
+fix ships in this release. `parseSourceFile` and `extractCallsFromSourceFile`
+are exported for callers that already hold a `SourceFile`.
+
+### Added (defensive)
+
+Ingest now samples heap usage every 25 files and, on approaching V8's limit,
+degrades to name matching for the remainder of the run with an actionable
+message rather than letting the process die silently. This has not fired in
+testing — nest peaks at 468 MB and the TypeScript compiler repo at 1.4 GB,
+both well inside a default heap — so it is insurance, not a fix for an
+observed failure.
+
+### Migration
+
+Both features add nullable columns to existing tables. Databases created
+before 3.4.0 migrate in place on first open — verified against a real 3.3.1
+graph (512 functions, 2309 relationships, all bindings preserved). The new
+columns populate on the next `structx ingest`; until then the graph behaves
+exactly as it did on 3.3.1.
+
 ## [3.3.1] — 2026-05-09
 
 ### Added

@@ -15,7 +15,7 @@ import {
   type PromptFunction
 } from './prompt';
 import { validateSemanticResponse, type SemanticResult } from './validator';
-import { estimateCost } from '../utils/tokens';
+import { resolveCost } from '../utils/tokens';
 import { logger } from '../utils/logger';
 import { normalizeRepoPath } from '../utils/paths';
 
@@ -155,7 +155,7 @@ export async function analyzeBatch(
     outputTokens = out.outputTokens;
     result.totalInputTokens += inputTokens;
     result.totalOutputTokens += outputTokens;
-    result.totalCost += estimateCost(model, inputTokens, outputTokens);
+    result.totalCost += resolveCost(model, inputTokens, outputTokens, out.costUsd);
   } catch (err: any) {
     const fatal = isFatalProviderError(err);
     if (fatal.fatal) {
@@ -201,7 +201,7 @@ export async function analyzeBatch(
       });
       result.totalInputTokens += retry.inputTokens;
       result.totalOutputTokens += retry.outputTokens;
-      result.totalCost += estimateCost(model, retry.inputTokens, retry.outputTokens);
+      result.totalCost += resolveCost(model, retry.inputTokens, retry.outputTokens, retry.costUsd);
 
       validation = validateSemanticResponse(retry.text);
       if (validation.valid || validation.results.length > 0) {
@@ -293,7 +293,7 @@ export async function analyzeTypes(
     })));
 
     try {
-      const { text, inputTokens, outputTokens } = await client.complete({
+      const { text, inputTokens, outputTokens, costUsd } = await client.complete({
         model,
         prompt,
         maxTokens: batch.length * 100,
@@ -301,7 +301,7 @@ export async function analyzeTypes(
 
       result.totalInputTokens += inputTokens;
       result.totalOutputTokens += outputTokens;
-      result.totalCost += estimateCost(model, inputTokens, outputTokens);
+      result.totalCost += resolveCost(model, inputTokens, outputTokens, costUsd);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ id?: number; name: string; purpose: string }>;
@@ -352,7 +352,7 @@ export async function analyzeRoutes(
     })));
 
     try {
-      const { text, inputTokens, outputTokens } = await client.complete({
+      const { text, inputTokens, outputTokens, costUsd } = await client.complete({
         model,
         prompt,
         maxTokens: batch.length * 100,
@@ -360,7 +360,7 @@ export async function analyzeRoutes(
 
       result.totalInputTokens += inputTokens;
       result.totalOutputTokens += outputTokens;
-      result.totalCost += estimateCost(model, inputTokens, outputTokens);
+      result.totalCost += resolveCost(model, inputTokens, outputTokens, costUsd);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ method: string; path: string; purpose: string }>;
@@ -420,7 +420,7 @@ export async function analyzeFileSummaries(
     }));
 
     try {
-      const { text, inputTokens, outputTokens } = await client.complete({
+      const { text, inputTokens, outputTokens, costUsd } = await client.complete({
         model,
         prompt,
         maxTokens: batch.length * 100,
@@ -428,7 +428,7 @@ export async function analyzeFileSummaries(
 
       result.totalInputTokens += inputTokens;
       result.totalOutputTokens += outputTokens;
-      result.totalCost += estimateCost(model, inputTokens, outputTokens);
+      result.totalCost += resolveCost(model, inputTokens, outputTokens, costUsd);
 
       const cleaned = text.replace(/^```json?\s*/m, '').replace(/```\s*$/m, '').trim();
       const parsed = JSON.parse(cleaned) as Array<{ id?: number; path: string; purpose: string }>;

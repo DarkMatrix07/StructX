@@ -22,6 +22,11 @@ export function openDatabase(dbPath: string, opts: OpenDbOptions = {}): Database
   if (!opts.readonly) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+    // Wait rather than failing instantly when another StructX process holds a
+    // write lock — `structx watch` running alongside a manual ingest is a
+    // normal setup, and WAL contention there is usually momentary. Anything
+    // longer than this is a genuine conflict and surfaces as a clean message.
+    db.pragma('busy_timeout = 10000');
     runMigrations(db);
     normalizeExistingFilePaths(db);
   } else {
@@ -114,6 +119,17 @@ function runMigrations(db: Database.Database): void {
 
   migrateTypesKindConstraint(db);
 
+  // v3.4.0 columns. schema.sql uses CREATE TABLE IF NOT EXISTS, which is a
+  // no-op on databases that already have these tables — so new columns have
+  // to be added explicitly for existing graphs. All three are nullable, so
+  // old rows stay valid and simply re-populate on the next ingest.
+  addColumnIfMissing(db, 'relationships', 'callee_decl_file', 'TEXT');
+  addColumnIfMissing(db, 'relationships', 'callee_decl_name', 'TEXT');
+  addColumnIfMissing(db, 'routes', 'handler_function_id', 'INTEGER REFERENCES functions(id) ON DELETE SET NULL');
+  try {
+    db.exec('CREATE INDEX IF NOT EXISTS idx_routes_handler_function ON routes(handler_function_id)');
+  } catch {}
+
   // type_relationships was added in v3.3.0. Old DBs migrate idempotently
   // — schema.sql's CREATE IF NOT EXISTS already covers this on first
   // open after upgrade, but we explicitly trip the FTS rebuild so the
@@ -138,6 +154,22 @@ function runMigrations(db: Database.Database): void {
       `);
     }
   } catch {}
+}
+
+// Add a column to an existing table when it isn't there yet. SQLite has no
+// `ADD COLUMN IF NOT EXISTS`, so we check PRAGMA table_info first. Silent
+// no-op when the table itself doesn't exist yet (fresh DB — schema.sql
+// already declares the column).
+function addColumnIfMissing(db: Database.Database, table: string, column: string, definition: string): void {
+  try {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.length === 0) return;
+    if (columns.some(c => c.name === column)) return;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch {
+    // Best effort — a failed migration leaves the older, still-functional
+    // name-matching behavior in place rather than breaking the connection.
+  }
 }
 
 // SQLite doesn't support ALTER TABLE to change a CHECK constraint, so for

@@ -11,6 +11,7 @@ import { logger, setLogLevel } from './utils/logger';
 import { analyzeBatch, rebuildSearchIndex, analyzeTypes, analyzeRoutes, analyzeFileSummaries } from './semantic/analyzer';
 import { estimateAnalysisCost, formatCostEstimate } from './semantic/cost';
 import { getPendingAnalysis, getPendingAnalysisCount, enqueueUnanalyzedFunctions, insertQaRun, getCachedAskResponse, insertCachedAskResponse } from './db/queries';
+import { findCallPaths, findRoutePathsTo, semanticQuery, semanticFacets } from './db/queries';
 import { classifyQuestionWithUsage } from './query/classifier';
 import { directLookup, directLookupExpanded, relationshipQuery, semanticSearch, domainQuery, impactAnalysis, routeQuery, routeKeywordQuery, typeQuery, fileQuery, listQuery, patternQuery } from './query/retriever';
 import { buildContext } from './query/context-builder';
@@ -22,8 +23,17 @@ import { ingestDirectory, printIngestResult } from './ingest/ingester';
 import { watchDirectory } from './watch/watcher';
 import { runMcpServer } from './mcp/server';
 import { diffEntities } from './git/diff';
+import type { LlmProvider } from './utils/llm';
 
 const program = new Command();
+
+// Type guard for `--provider`. Gemini has been a fully supported provider
+// since the multi-provider refactor, but the CLI validation listed only
+// anthropic and openrouter — so `--provider gemini` was silently ignored and
+// the run fell back to whatever the config/env said.
+function isKnownProvider(value: string | undefined): value is LlmProvider {
+  return value === 'anthropic' || value === 'gemini' || value === 'openrouter';
+}
 
 function parseMaxTokens(value: string): number {
   const parsed = Number(value);
@@ -44,10 +54,21 @@ function formatProviderError(err: any): string {
   return message;
 }
 
+// A locked graph is a normal operational conflict (a `structx watch` running
+// in another terminal), not a crash. Surface it as a one-line message rather
+// than an unhandled better-sqlite3 stack trace.
+process.on('uncaughtException', (err: any) => {
+  if (err?.name === 'GraphLockedError') {
+    console.error(`\n${err.message}`);
+    process.exit(1);
+  }
+  throw err;
+});
+
 program
   .name('structx')
   .description('Graph-powered code intelligence CLI for TypeScript')
-  .version('3.3.1')
+  .version('3.4.0')
   .option('--verbose', 'Enable verbose logging')
   .hook('preAction', (thisCommand) => {
     if (thisCommand.opts().verbose) {
@@ -61,7 +82,7 @@ program
   .description('One-step bootstrap: init + ingest + analyze')
   .argument('[repo-path]', 'Path to TypeScript repository', '.')
   .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
-  .option('--provider <name>', 'LLM provider: anthropic | openrouter', undefined)
+  .option('--provider <name>', 'LLM provider: anthropic | gemini | openrouter', undefined)
   .action(async (repoPath: string, opts: { apiKey?: string; provider?: string }) => {
     const resolved = path.resolve(repoPath);
     const structxDir = getStructXDir(resolved);
@@ -75,7 +96,7 @@ program
       const db = initializeDatabase(dbPath);
       db.close();
       const initial: any = { repoPath: resolved };
-      if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+      if (isKnownProvider(opts.provider)) {
         initial.provider = opts.provider;
       }
       saveConfig(structxDir, initial);
@@ -87,14 +108,14 @@ program
 
     // Step 2: Ingest
     const config = loadConfig(structxDir);
-    if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+    if (isKnownProvider(opts.provider)) {
       config.provider = opts.provider;
     }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
     const db = openDatabase(dbPath);
 
     console.log(`\nScanning ${resolved} for TypeScript files...`);
-    const ingestResult = ingestDirectory(db, resolved, config.diffThreshold);
+    const ingestResult = ingestDirectory(db, resolved, config.diffThreshold, { typeResolution: config.typeResolution });
     printIngestResult(ingestResult);
 
     // Step 3: Analyze (auto-confirm)
@@ -506,7 +527,7 @@ program
     const db = openDatabase(dbPath);
 
     console.log(`Scanning ${resolved} for TypeScript files...`);
-    const ingestResult = ingestDirectory(db, resolved, config.diffThreshold);
+    const ingestResult = ingestDirectory(db, resolved, config.diffThreshold, { typeResolution: config.typeResolution });
     printIngestResult(ingestResult);
 
     db.close();
@@ -537,11 +558,14 @@ program
 
     if (opts.initialIngest !== false) {
       console.log(`Initial scan of ${resolved}...`);
-      const result = ingestDirectory(db, resolved, config.diffThreshold);
+      const result = ingestDirectory(db, resolved, config.diffThreshold, { typeResolution: config.typeResolution });
       printIngestResult(result);
     }
 
-    const stop = await watchDirectory(db, resolved, { diffThreshold: config.diffThreshold });
+    const stop = await watchDirectory(db, resolved, {
+      diffThreshold: config.diffThreshold,
+      typeResolution: config.typeResolution,
+    });
 
     let shuttingDown = false;
     const shutdown = async (signal: string) => {
@@ -606,6 +630,139 @@ program
     }
   });
 
+// ── path ──
+program
+  .command('path')
+  .description('Trace the call chain to a function — from another function, or from every HTTP endpoint that reaches it')
+  .argument('<to>', 'Destination function name')
+  .option('--from <name>', 'Starting function. Omit to search from all HTTP endpoints instead.')
+  .option('--repo <path>', 'Path to TypeScript repository', '.')
+  .option('--max-depth <n>', 'Maximum hops to traverse (default 8)', (v) => parseInt(v, 10))
+  .option('--limit <n>', 'Maximum paths to return (default 5)', (v) => parseInt(v, 10))
+  .action((to: string, opts: { from?: string; repo: string; maxDepth?: number; limit?: number }) => {
+    const resolved = path.resolve(opts.repo);
+    const dbPath = getDbPath(getStructXDir(resolved));
+    if (!fs.existsSync(dbPath)) {
+      console.log('StructX not initialized. Run "structx setup ." first.');
+      return;
+    }
+    const db = openDatabase(dbPath);
+    const maxDepth = opts.maxDepth ?? 8;
+    const limit = opts.limit ?? 5;
+
+    const renderChain = (steps: Array<{ name: string; filePath: string; start_line: number; purpose: string | null }>) => {
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        const indent = '  '.repeat(i);
+        const arrow = i > 0 ? '└─ ' : '';
+        const purpose = s.purpose ? `  — ${s.purpose}` : '';
+        console.log(`  ${indent}${arrow}${s.name}  [${s.filePath}:${s.start_line}]${purpose}`);
+      }
+    };
+
+    if (!opts.from) {
+      const routePaths = findRoutePathsTo(db, to, maxDepth, limit);
+      console.log(`Endpoints reaching ${to}: ${routePaths.length}`);
+      for (const rp of routePaths) {
+        // An inline handler is named after its own route, so printing both the
+        // header and the first step would say the same thing twice. Fold the
+        // handler's location into the header instead.
+        const [first, ...rest] = rp.callPath;
+        if (first && first.name === `${rp.method} ${rp.path}`) {
+          console.log(`\n${rp.method} ${rp.path}  [${first.filePath}:${first.start_line}]`);
+          renderChain(rest);
+        } else {
+          console.log(`\n${rp.method} ${rp.path}`);
+          renderChain(rp.callPath);
+        }
+      }
+      if (routePaths.length === 0) {
+        console.log('\nNo indexed endpoint reaches it. The handler may be an inline arrow function, or the chain may exceed --max-depth.');
+      }
+      db.close();
+      return;
+    }
+
+    const paths = findCallPaths(db, opts.from, to, maxDepth, limit);
+    console.log(`Call paths ${opts.from} → ${to}: ${paths.length}`);
+    for (const p of paths) {
+      console.log(`\n${p.depth} hop${p.depth === 1 ? '' : 's'}:`);
+      renderChain(p.steps);
+    }
+    if (paths.length === 0) {
+      console.log(`\nNo path found within ${maxDepth} hops. Unresolved edges (external or dynamic calls) are not traversable.`);
+    }
+    db.close();
+  });
+
+// ── query ──
+program
+  .command('query')
+  .description('Filter functions by semantic properties (domain, side effects, complexity) instead of keywords')
+  .option('--repo <path>', 'Path to TypeScript repository', '.')
+  .option('--domain <name>', 'Domain label, e.g. database, authentication, validation')
+  .option('--complexity <level>', 'low | medium | high')
+  .option('--side-effect <text>', 'Substring match against recorded side effects, e.g. "write"')
+  .option('--exported', 'Only exported functions')
+  .option('--async', 'Only async functions')
+  .option('--name <pattern>', 'SQL LIKE pattern on the function name, e.g. "handle%"')
+  .option('--file <pattern>', 'SQL LIKE pattern on the file path, e.g. "src/auth/%"')
+  .option('--limit <n>', 'Maximum results (default 50)', (v) => parseInt(v, 10))
+  .action((opts: any) => {
+    const resolved = path.resolve(opts.repo);
+    const dbPath = getDbPath(getStructXDir(resolved));
+    if (!fs.existsSync(dbPath)) {
+      console.log('StructX not initialized. Run "structx setup ." first.');
+      return;
+    }
+    const db = openDatabase(dbPath);
+
+    const hasFilter = ['domain', 'complexity', 'sideEffect', 'exported', 'async', 'name', 'file']
+      .some(k => opts[k] !== undefined);
+
+    if (!hasFilter) {
+      const facets = semanticFacets(db);
+      console.log(`Semantic index: ${facets.analyzed} of ${facets.total} functions analyzed\n`);
+      if (facets.analyzed === 0) {
+        console.log('Run "structx analyze . --yes" to populate domain, side-effect and complexity labels.');
+      }
+      if (facets.domains.length > 0) {
+        console.log('Domains:');
+        for (const d of facets.domains) console.log(`  ${d.value.padEnd(16)} ${d.count}`);
+      }
+      if (facets.complexities.length > 0) {
+        console.log('\nComplexity:');
+        for (const d of facets.complexities) console.log(`  ${d.value.padEnd(16)} ${d.count}`);
+      }
+      db.close();
+      return;
+    }
+
+    const rows = semanticQuery(db, {
+      domain: opts.domain,
+      complexity: opts.complexity,
+      sideEffect: opts.sideEffect,
+      isExported: opts.exported ? true : undefined,
+      isAsync: opts.async ? true : undefined,
+      namePattern: opts.name,
+      filePattern: opts.file,
+      limit: opts.limit ?? 50,
+    });
+
+    console.log(`Matching functions: ${rows.length}\n`);
+    for (const fn of rows) {
+      let sideEffects: string[] = [];
+      try { if (fn.side_effects_json) sideEffects = JSON.parse(fn.side_effects_json); } catch {}
+      const tags = [fn.domain, fn.complexity, fn.is_exported ? 'exported' : null, fn.is_async ? 'async' : null]
+        .filter(Boolean).join(' · ');
+      console.log(`  ${fn.name}  [${fn.filePath}:${fn.start_line}]${tags ? `  (${tags})` : ''}`);
+      if (fn.purpose) console.log(`      ${fn.purpose}`);
+      if (sideEffects.length > 0) console.log(`      side effects: ${sideEffects.join(', ')}`);
+    }
+    if (rows.length === 0) console.log('  (none)');
+    db.close();
+  });
+
 // ── mcp ──
 program
   .command('mcp')
@@ -628,7 +785,7 @@ program
   .argument('[repo-path]', 'Path to TypeScript repository', '.')
   .option('--yes', 'Skip cost confirmation prompt')
   .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
-  .option('--provider <name>', 'LLM provider: anthropic | openrouter')
+  .option('--provider <name>', 'LLM provider: anthropic | gemini | openrouter')
   .action(async (repoPath: string, opts: { yes?: boolean; apiKey?: string; provider?: string }) => {
     const resolved = path.resolve(repoPath);
     const structxDir = getStructXDir(resolved);
@@ -640,7 +797,7 @@ program
     }
 
     const config = loadConfig(structxDir);
-    if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+    if (isKnownProvider(opts.provider)) {
       config.provider = opts.provider;
     }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
@@ -693,6 +850,7 @@ program
     let totalOutputTokens = 0;
     let totalCost = 0;
     let batchNum = 0;
+    let abortReason: string | undefined;
 
     while (true) {
       const pending = getPendingAnalysis(db, config.batchSize);
@@ -710,13 +868,27 @@ program
       totalInputTokens += batchResult.totalInputTokens;
       totalOutputTokens += batchResult.totalOutputTokens;
       totalCost += batchResult.totalCost;
+
+      // Stop on a fatal provider error (402 out of credits, 401 bad key).
+      // `setup` has always done this; `analyze` dropped the flag and kept
+      // hammering a failing endpoint, reporting a large "Failed: N" with no
+      // reason. Items stay queued and re-run once the issue is fixed.
+      if (batchResult.aborted) {
+        abortReason = batchResult.abortReason;
+        break;
+      }
     }
 
-    // Analyze types, routes, and file summaries
-    console.log('\n  Analyzing types, routes, and file summaries...');
-    const typeResult = await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
-    const routeResult = await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
-    const fileResult = await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
+    // Analyze types, routes, and file summaries — skipped entirely when the
+    // function loop already hit a fatal provider error.
+    const empty = { analyzed: 0, cached: 0, failed: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 };
+    if (!abortReason) console.log('\n  Analyzing types, routes, and file summaries...');
+    const typeResult = abortReason ? empty : await analyzeTypes(db, config.analysisModel, getLlmConfig(config));
+    const routeResult = abortReason || (typeResult as any).aborted
+      ? empty : await analyzeRoutes(db, config.analysisModel, getLlmConfig(config));
+    const fileResult = abortReason || (typeResult as any).aborted || (routeResult as any).aborted
+      ? empty : await analyzeFileSummaries(db, config.analysisModel, getLlmConfig(config));
+    abortReason ??= (typeResult as any).abortReason ?? (routeResult as any).abortReason ?? (fileResult as any).abortReason;
 
     totalAnalyzed += typeResult.analyzed + routeResult.analyzed + fileResult.analyzed;
     totalFailed += typeResult.failed + routeResult.failed + fileResult.failed;
@@ -735,6 +907,10 @@ program
     console.log(`  Input tokens:   ${totalInputTokens.toLocaleString()}`);
     console.log(`  Output tokens:  ${totalOutputTokens.toLocaleString()}`);
     console.log(`  Total cost:     $${totalCost.toFixed(4)}`);
+    if (abortReason) {
+      console.log(`\nAborted: ${abortReason}`);
+      console.log(`Failed items remain queued — re-run \`structx analyze .\` after fixing the issue.`);
+    }
   });
 
 // ── ask ──
@@ -744,7 +920,7 @@ program
   .argument('<question>', 'The question to ask')
   .option('--repo <path>', 'Path to TypeScript repository', '.')
   .option('--api-key <key>', 'API key for the chosen provider (overrides env vars)')
-  .option('--provider <name>', 'LLM provider: anthropic | openrouter')
+  .option('--provider <name>', 'LLM provider: anthropic | gemini | openrouter')
   .option('--max-tokens <n>', 'Maximum answer output tokens for this ask (64-8192)', parseMaxTokens)
   .action(async (question: string, opts: { repo: string; apiKey?: string; provider?: string; maxTokens?: number }) => {
     const resolved = path.resolve(opts.repo);
@@ -756,17 +932,17 @@ program
       console.log('StructX not initialized. Running automatic setup...\n');
       const db = initializeDatabase(dbPath);
       const initial: any = { repoPath: resolved };
-      if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+      if (isKnownProvider(opts.provider)) {
         initial.provider = opts.provider;
       }
       saveConfig(structxDir, initial);
       ensureStructxGitignored(resolved);
       const config = loadConfig(structxDir);
-      if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+      if (isKnownProvider(opts.provider)) {
         config.provider = opts.provider;
       }
       if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
-      const result = ingestDirectory(db, resolved, config.diffThreshold);
+      const result = ingestDirectory(db, resolved, config.diffThreshold, { typeResolution: config.typeResolution });
       printIngestResult(result);
 
       // Run semantic analysis if API key available
@@ -796,7 +972,7 @@ program
     }
 
     const config = loadConfig(structxDir);
-    if (opts.provider === 'anthropic' || opts.provider === 'openrouter') {
+    if (isKnownProvider(opts.provider)) {
       config.provider = opts.provider;
     }
     if (opts.apiKey) config.anthropicApiKey = opts.apiKey;
@@ -818,7 +994,7 @@ program
     if (stats.totalFunctions === 0 && stats.totalTypes === 0 && stats.totalRoutes === 0) {
       console.log('WARNING: The knowledge graph is empty (0 functions, 0 types, 0 routes).');
       console.log('Running automatic re-ingestion...\n');
-      const result = ingestDirectory(db, resolved, config.diffThreshold);
+      const result = ingestDirectory(db, resolved, config.diffThreshold, { typeResolution: config.typeResolution });
       printIngestResult(result);
       if (result.queued > 0) {
         console.log('\nRunning semantic analysis...');

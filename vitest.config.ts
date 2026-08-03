@@ -8,5 +8,10 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     testTimeout: 30000,
+    // Agent worktrees under .claude/ contain full copies of this repo,
+    // tests included. Without this exclude, `vitest run` collects those
+    // stale copies alongside the real suite — they pass against old code
+    // and mask regressions in src/.
+    exclude: ['**/node_modules/**', '**/dist/**', '.claude/**'],
   },
 });

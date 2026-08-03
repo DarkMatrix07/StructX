@@ -48,6 +48,12 @@ export function buildContext(retrieved: RetrievedContext, question: string): str
       break;
     case 'impact':
       sections.push(formatImpactContext(retrieved.functions));
+      // Endpoints reached through the changed function — surfaced separately
+      // because "which APIs break" is usually the part the user cares about
+      // most in an impact answer.
+      if (retrieved.routes.length > 0) {
+        sections.push(`HTTP endpoints affected (${retrieved.routes.length}):\n\n` + formatRoutesContext(retrieved.routes));
+      }
       break;
     case 'route':
       sections.push(formatRoutesContext(retrieved.routes));
